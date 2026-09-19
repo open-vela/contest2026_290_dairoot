@@ -11,7 +11,7 @@ description: 将 YOLO 检测模型转换并部署到 Rockchip RKNN NPU，核对 
 
 确认 YOLO 版本、任务、权重来源/类别、目标 SoC、输入尺寸、转换机、Toolkit2/runtime 版本以及精度和延迟目标。定位包含 `linux-apps/miloco-server/` 的源码根为 `CONTEST_ROOT`；独立安装 Skill 时仍需目标源码，不依赖个人机器路径。
 
-本项目有 `tools/convert_rknn.py`、`rknn_yolo.py` 和视频服务 `web.py`，使用 Rockchip Model Zoo 优化的 **YOLO11n 九输出 ONNX**，在 RK3576 上部署；仓库不含 `.onnx/.rknn` 模型产物。
+本项目有 `tools/convert_rknn.py`、`rknn_yolo.py` 和视频服务 `web.py`，使用 Rockchip Model Zoo 优化的 **YOLO11n 九输出 ONNX**，在 RK3576 上部署；Git 工作树不含 `.onnx/.rknn` 模型产物，已有 RKNN 可从[官方 Release 下载](../../docs/rknn-models-2026-09-19.md)。
 
 转换和运行命令、源码定位见 [项目执行参考](references/project-workflow.md)。涉及新版本模型时，核对 [官方 YOLO11 示例](https://github.com/airockchip/rknn_model_zoo/blob/main/examples/yolo11/README.md) 及对应版本的导出方式。
 

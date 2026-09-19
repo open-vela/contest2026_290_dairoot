@@ -134,7 +134,9 @@ SPEAKER_BACKEND=modelscope uv run python server.py
 
 默认配置依赖 `rknn_models/` 下的 `sensevoice_5s.rknn`（473 MB）和
 `eres2netv2_3s.rknn`（174 MB）；ASR 切回 CPU 时只需要后者。路径可用 `SPEAKER_RKNN_PATH` / `ASR_RKNN_PATH` 改。
-这些文件**没有提交到仓库**。模型准备、Ubuntu 转换环境、运行库兼容处理与部署验收
+这些文件以官方仓库 Release 附件提供，不进入 Git 历史；下载、校验及额外的
+ASR 前端 / VAD 依赖见 [RKNN 模型交付说明](../../docs/rknn-models-2026-09-19.md)。
+模型准备、Ubuntu 转换环境、运行库兼容处理与部署验收
 统一见 [语音模型 RKNN 迁移 Skill](../../skills/speech-rknn-migration/SKILL.md) 及其
 [ASR/声纹执行参考](../../skills/speech-rknn-migration/references/asr-project-workflow.md)。
 

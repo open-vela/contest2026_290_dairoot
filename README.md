@@ -102,6 +102,8 @@ manifest `<linkfile>` 注入，以 patch 系列放在 [`nuttx-side/`](nuttx-side
 准备依赖（`uv sync`）、模型和个人配置；miloco 的虚拟环境还需按其 README 开启
 系统 GStreamer/GI 包访问。麦克风驱动见[板级 README](board/contest_board/README.md)，供电和 zram 见
 [Linux 服务部署说明](skills/openvela-kws-deployment/references/linux-systemd-services.md)。
+三个预转换 RKNN 模型已发布到官方仓库，下载、SHA256 和放置位置见
+[RKNN 模型交付说明](docs/rknn-models-2026-09-19.md)。
 
 **打开三个独立终端，每个终端都从 `contest2026_290_dairoot` 的上一级目录开始。**
 下面的进程会一直占用当前终端；先启动摄像头与 ASR 服务，再启动 harness，保持三个

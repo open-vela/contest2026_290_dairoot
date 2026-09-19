@@ -71,7 +71,8 @@ uv run python -m unittest -v test_video_pipeline
 ## YOLO 模型（NPU）
 
 从本目录启动服务时，`rknn_yolo.py` 加载 `yolo11n_int8.rknn`。
-该模型产物没有提交到仓库，启用检测前需准备好模型和兼容的 RKNN 运行时。
+该模型已作为官方仓库 Release 附件发布，下载、校验和放置位置见
+[RKNN 模型交付说明](../../docs/rknn-models-2026-09-19.md)。启用检测前需准备好模型和兼容的 RKNN 运行时。
 模型来源、转换环境、校准集与转换步骤统一见
 [YOLO 迁移到 RKNN NPU Skill](../../skills/yolo-rknn-migration/SKILL.md) 及其
 [项目执行参考](../../skills/yolo-rknn-migration/references/project-workflow.md)。
