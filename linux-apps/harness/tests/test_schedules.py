@@ -23,6 +23,8 @@ from starlette.testclient import TestClient
 with patch("dotenv.load_dotenv"):
     import main
 
+from aichat_sdk.llm import mcp as sdk_mcp
+from aichat_sdk.llm.mcp.external import get_external_mcp_servers
 import schedules
 from server import create_app
 
@@ -449,7 +451,6 @@ class ScheduleHttpTest(TempDatabase, unittest.TestCase):
         page = self.web.get("/").text
         for marker in ('id="schedule-group"', 'id="schedule-dialog"', "设置定时任务", 'placeholder="说明…"', "高级"):
             self.assertIn(marker, page)
-        self.assertIn("定时任务", main.DEFAULT_CONFIG["mcp"]["mcpServers"])
 
     def test_create_list_update_run_and_delete(self):
         response = self.web.get("/api/schedules")
@@ -497,6 +498,69 @@ class ScheduleHttpTest(TempDatabase, unittest.TestCase):
             self.assertEqual(self.web.get("/api/schedules").status_code, 503)
             response = self.web.post("/api/schedules", json={"prompt": "x", "repeat": "daily", "time": "09:00"})
             self.assertEqual(response.status_code, 503)
+
+
+class BuiltinMcpTest(TempDatabase, unittest.IsolatedAsyncioTestCase):
+    """定时任务的 MCP 由 harness 自己注册，不依赖 config.json；配置里写了同名 server 时以配置为准。"""
+
+    def setUp(self):
+        self.make_path()
+        db_path = patch.object(main, "SESSION_DB_PATH", self.path)
+        db_path.start()
+        self.addCleanup(db_path.stop)
+        self.client = main.AIClient(copy.deepcopy(main.DEFAULT_CONFIG))
+        # SDK 的注册表是进程级的，别的测试走 _start_bot 时也会注册：开始前清掉，结束后再清一次
+        sdk_mcp.remove_mcp_server(main.SCHEDULE_MCP_SERVER)
+        self.addCleanup(sdk_mcp.remove_mcp_server, main.SCHEDULE_MCP_SERVER)
+
+    async def start_bot(self):
+        bot = SimpleNamespace(llm=SimpleNamespace(messages=[]), initialize=AsyncMock(), close=AsyncMock())
+        with patch.object(main, "ChatBot", return_value=bot), \
+                patch.object(main, "tts_configuration_error", return_value=""), \
+                patch.object(main, "load_skills", return_value=[]), \
+                patch.object(main, "register_default_tools_server"), \
+                patch.object(self.client, "play_audio", new=AsyncMock()):
+            await self.client._start_bot()
+            await self.client._stop_bot()
+
+    @staticmethod
+    def registered():
+        return {server.name: server for server in get_external_mcp_servers()}
+
+    @staticmethod
+    def with_config_entry(config):
+        config = copy.deepcopy(config)
+        config["mcp"]["mcpServers"][main.SCHEDULE_MCP_SERVER] = {
+            "command": "python", "args": ["mcp/schedule_mcp.py"], "enabled": False,
+        }
+        return config
+
+    async def test_registered_without_any_config(self):
+        self.assertNotIn(main.SCHEDULE_MCP_SERVER, main.DEFAULT_CONFIG["mcp"]["mcpServers"])
+        await self.start_bot()
+        server = self.registered()[main.SCHEDULE_MCP_SERVER]
+        # 用本 venv 的解释器跑脚本的绝对路径，跟工作目录和 PATH 无关
+        self.assertEqual((server.command, server.args), (sys.executable, [main.SCHEDULE_MCP_SCRIPT]))
+        self.assertTrue(Path(main.SCHEDULE_MCP_SCRIPT).is_file())
+        row = next(row for row in self.client.mcp_status() if row["name"] == main.SCHEDULE_MCP_SERVER)
+        self.assertTrue(row["readonly"])  # 页面显示为只读的「默认」行
+
+    async def test_config_entry_with_the_same_name_takes_over(self):
+        self.client.config = self.with_config_entry(self.client.config)
+        await self.start_bot()
+        self.assertNotIn(main.SCHEDULE_MCP_SERVER, self.registered())  # enabled: false，不再提供
+
+    def test_switching_between_builtin_and_config_drops_the_old_connection(self):
+        builtin, configured = self.client.config, self.with_config_entry(self.client.config)
+        for old, new in ((builtin, configured), (configured, builtin)):
+            with self.subTest(adds_entry=new is configured), patch.object(main, "remove_mcp_server") as remove:
+                self.client.config = old
+                self.client._sync_mcp_registry(new)
+                remove.assert_any_call(main.SCHEDULE_MCP_SERVER)
+        with patch.object(main, "remove_mcp_server") as remove:
+            self.client.config = configured
+            self.client._sync_mcp_registry(copy.deepcopy(configured))
+            remove.assert_not_called()
 
 
 class HarnessOpener:

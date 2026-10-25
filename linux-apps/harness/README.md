@@ -80,9 +80,10 @@ MiMo 需在 `.env` 配置 `MIMO_API_KEY`，可选 `MIMO_TTS_VOICE`（默认 `mim
 
 - `mcp/miloco_mcp.py`：米家设备和摄像头，读取 harness 根目录的 `.env`。
 - `mcp/volume_mcp.py`：本机扬声器音量。
-- `mcp/schedule_mcp.py`：定时任务，调用 harness 本机的定时任务接口，见[定时任务](#定时任务)。
+- `mcp/schedule_mcp.py`：定时任务，调用 harness 本机的定时任务接口，内置加载，见[定时任务](#定时任务)。
 
-配置中的脚本路径相对于 harness 目录；MCP 服务列表以保存的配置为准。
+配置中的脚本路径相对于 harness 目录；MCP 服务列表以保存的配置为准。SDK 自带的 aichat-tools 和
+内置的「定时任务」不写在配置里，由 harness 启动时自动加载，配置台显示为只读的「默认」行。
 
 ## 聊天记录
 
@@ -309,15 +310,15 @@ uv run python -m unittest -v tests.test_volume_mcp
 - 历史会话里这条触发消息显示为用户消息；AI 日记把它记作「定时任务」，只有提醒、没人回话的会话不写日记。
 - 最多 50 个任务，说明最多 500 字。与配置台其他接口一样没有鉴权，同网段都能查看和修改。
 
-`mcp/schedule_mcp.py`（配置名「定时任务」）把这些操作提供给模型：`create_scheduled_task`、
+`mcp/schedule_mcp.py`（MCP server 名「定时任务」）把这些操作提供给模型：`create_scheduled_task`、
 `list_scheduled_tasks`、`update_scheduled_task` 和 `delete_scheduled_task`。它通过本机
 `http://127.0.0.1:8080/api/schedules` 读写，与配置台是同一份数据，语音新建的任务会实时出现在页面上。
 「X 分钟后」用 `in_minutes`；不重复的任务不填日期时，取这个时间下一次到来的那天（今天已过就是明天）。
-默认配置已包含该服务；已有 `config.json` 不会自动补上，需要时在配置台的 MCP servers 里添加：
 
-```json
-"定时任务": {"command": "python", "args": ["mcp/schedule_mcp.py"]}
-```
+该服务是内置的，不写进 `config.json`：harness 启动时用本服务的 Python 解释器自动加载脚本，
+配置台 MCP servers 里显示为只读的「默认」行。拉取代码后重启 harness 即可使用，不需要改配置。
+MCP 配置里写了同名的「定时任务」时以配置为准，例如设 `"enabled": false` 可以不给模型提供这组工具；
+定时任务分区和到点执行不受影响。
 
 接口（配置台和 MCP 共用）：
 
