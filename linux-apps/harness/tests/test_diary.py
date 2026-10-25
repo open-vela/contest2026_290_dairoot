@@ -19,6 +19,7 @@ with patch("dotenv.load_dotenv"):
     import main
 
 import diary
+import schedules
 from server import create_app
 from session_store import _write_database, save_session
 
@@ -105,6 +106,13 @@ class TranscriptTest(unittest.TestCase):
     def test_session_without_user_text_renders_empty(self):
         record = session_record({"role": "user", "content": ""}, {"role": "assistant", "content": "再见"})
         self.assertEqual(diary.render_session(record, TZ8), "")
+
+    def test_schedule_triggers_are_labelled_and_not_user_speech(self):
+        trigger = {"role": "user", "content": schedules.TRIGGER_PREFIX + "提醒大家喝水", "time": "2026-10-23T09:00:00+08:00"}
+        # 只有提醒、没人回话的会话跟误唤醒一样不写日记
+        self.assertEqual(diary.render_session(session_record(trigger, reply("该喝水啦")), TZ8), "")
+        text = diary.render_session(session_record(trigger, reply("该喝水啦"), said("好，马上喝")), TZ8)
+        self.assertEqual(text.splitlines()[1:], ["09:00 定时任务：提醒大家喝水", "助手：该喝水啦", "小明：好，马上喝"])
 
     def test_long_message_and_session_are_truncated(self):
         text = diary.render_session(session_record({"role": "user", "content": "长" * 500}), TZ8)

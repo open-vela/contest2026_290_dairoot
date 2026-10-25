@@ -240,6 +240,58 @@ details.thinking pre { color:var(--muted); }
 .composer button { flex:none; }
 #send-note { font-size:12px; margin-top:6px; min-height:1.6em; }
 #send-note.err { color:var(--err); }
+/* 定时任务：列表沿用 MCP 行的样式，新建 / 编辑弹窗仿 Codex 的「设置定时任务」 */
+#schedule-rows .mcp-row:first-child { border-top:0; }
+.schedule-name { flex:1; min-width:0; font-weight:600; padding:2px 5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.schedule-failed { color:var(--err); }
+.schedule-prompt { font-size:12.5px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere; }
+.schedule-meta { font-size:12px; color:var(--muted); line-height:1.7; margin-top:6px; }
+.schedule-meta .err { color:var(--err); overflow-wrap:anywhere; }
+.schedule-ops { display:flex; justify-content:flex-end; gap:14px; margin-top:8px; }
+.schedule-ops button { border:0; background:none; padding:0; font-size:12px; color:var(--muted); }
+.schedule-ops button:hover { color:var(--accent); }
+.schedule-ops button.danger:hover { color:var(--err); }
+#schedule-error { margin:0 0 8px; }
+#schedule-note { display:block; margin-top:8px; }
+#schedule-note:empty { display:none; }
+#schedule-dialog {
+  width:min(560px, calc(100vw - 32px)); max-height:90dvh; padding:24px;
+  border:1px solid var(--line); border-radius:22px; background:var(--card); color:var(--fg);
+  box-shadow:0 24px 64px #0f172a33;
+  color-scheme:light dark;  /* 日期、时间输入框的原生图标跟着深色模式变色 */
+}
+#schedule-dialog::backdrop { background:#10182866; }
+.schedule-head { display:flex; align-items:center; margin-bottom:18px; }
+.schedule-head h2 { font-size:18px; margin:0; }
+.schedule-x { display:flex; margin-left:auto; padding:4px; border:0; background:none; color:var(--muted); }
+.schedule-x:hover { color:var(--fg); }
+#schedule-prompt { display:block; min-height:128px; padding:12px 14px; border-radius:14px; background:var(--card); font-size:14px; line-height:1.6; }
+.schedule-card { margin-top:16px; padding:0 16px; border:1px solid var(--line); border-radius:14px; }
+.schedule-field { display:flex; align-items:center; gap:12px; min-height:50px; }
+.schedule-field[hidden] { display:none; }
+.schedule-field + .schedule-field { border-top:1px solid var(--line); }
+.schedule-field > label, .schedule-field > span:first-child { flex:none; margin:0; font-size:14px; color:var(--fg); }
+.schedule-value { display:flex; align-items:center; gap:6px; min-width:0; margin-left:auto; font-size:14px; color:var(--muted); }
+.schedule-value select, .schedule-value input {
+  width:auto; padding:4px 2px; border:0; background:none; color:var(--muted); font-size:14px; text-align:right;
+}
+.schedule-value select { cursor:pointer; }
+.schedule-value select:focus, .schedule-value input:focus { color:var(--fg); }
+#schedule-minute { width:3.6em; text-align:center; border:1px solid var(--line); border-radius:6px; }
+.weekday-chips { gap:4px; }
+.weekday-chips button { width:30px; height:30px; padding:0; border-radius:50%; font-size:12px; color:var(--muted); }
+.weekday-chips button[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#fff; }
+.schedule-advanced { display:inline-flex; align-items:center; gap:4px; margin-top:14px; padding:4px 2px; border:0; background:none; color:var(--muted); font-size:14px; }
+.schedule-advanced svg { transition:transform .15s; }
+.schedule-advanced[aria-expanded="true"] svg { transform:rotate(180deg); }
+#schedule-advanced-body { margin-top:10px; }
+#schedule-advanced-body .hint { margin:0; }
+#schedule-dialog-note { margin:12px 0 0; }
+#schedule-dialog-note:empty { display:none; }
+.schedule-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; }
+.schedule-actions button { padding:9px 22px; border-radius:99px; font-weight:600; }
+#schedule-cancel { background:var(--bg); border-color:transparent; }
+#schedule-cancel:hover { border-color:var(--line); }
 </style>
 </head>
 <body>
@@ -341,6 +393,23 @@ details.thinking pre { color:var(--muted); }
         </div>
       </section>
 
+      <section class="group" id="schedule-group">
+        <div class="group-head">
+          <span class="group-arrow">▶</span>
+          <h2>定时任务<span id="schedule-count" class="count"></span></h2>
+          <button type="button" id="schedule-add" class="link">+ 新建</button>
+        </div>
+        <div class="group-body">
+          <p class="hint">到点时助手自动执行说明并播报。改动立即生效，不用保存并重启；也可以直接对它说「每天早上八点播报天气」。</p>
+          <div id="schedule-error" class="mcp-error" role="alert"></div>
+          <div class="mcp-list">
+            <div id="schedule-rows"></div>
+            <div id="schedule-empty" class="mcp-empty">还没有定时任务</div>
+          </div>
+          <span id="schedule-note" class="note" role="status" aria-live="polite"></span>
+        </div>
+      </section>
+
     </div>
 
     <div class="actions">
@@ -373,6 +442,60 @@ details.thinking pre { color:var(--muted); }
   </form>
   <p id="voiceprint-note" class="note" role="status" aria-live="polite"></p>
   <div id="voiceprint-profiles"></div>
+</dialog>
+
+<dialog id="schedule-dialog" aria-labelledby="schedule-title">
+  <form id="schedule-form" novalidate>
+    <div class="schedule-head">
+      <h2 id="schedule-title">设置定时任务</h2>
+      <button type="button" id="schedule-close" class="schedule-x" aria-label="关闭">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <textarea id="schedule-prompt" rows="4" maxlength="500" placeholder="说明…" aria-label="说明：到点时让助手做什么"></textarea>
+    <div class="schedule-card">
+      <div class="schedule-field">
+        <label for="schedule-repeat">重复</label>
+        <span class="schedule-value">
+          <select id="schedule-repeat">
+            <option value="once">不重复</option>
+            <option value="hourly">每小时</option>
+            <option value="daily">每天</option>
+            <option value="weekdays">工作日</option>
+            <option value="weekly">每周</option>
+          </select>
+        </span>
+      </div>
+      <div class="schedule-field" id="schedule-weekdays-row" hidden>
+        <span>星期</span>
+        <span class="schedule-value weekday-chips" id="schedule-weekdays" role="group" aria-label="每周哪几天"></span>
+      </div>
+      <div class="schedule-field" id="schedule-date-row" hidden>
+        <label for="schedule-date">日期</label>
+        <span class="schedule-value"><input type="date" id="schedule-date"></span>
+      </div>
+      <div class="schedule-field" id="schedule-time-row">
+        <label for="schedule-time">时间</label>
+        <span class="schedule-value"><span id="schedule-tz"></span><input type="time" id="schedule-time" step="60"></span>
+      </div>
+      <div class="schedule-field" id="schedule-minute-row" hidden>
+        <label for="schedule-minute">分钟</label>
+        <span class="schedule-value">每小时第<input type="number" id="schedule-minute" min="0" max="59" step="1" inputmode="numeric">分</span>
+      </div>
+    </div>
+    <button type="button" id="schedule-advanced" class="schedule-advanced" aria-expanded="false" aria-controls="schedule-advanced-body">
+      高级<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <div id="schedule-advanced-body" hidden>
+      <label><span>名称</span><input id="schedule-name" maxlength="40" autocomplete="off" placeholder="可不填，列表里显示说明的开头"></label>
+      <p class="hint">到点时助手把说明当作任务执行并播报。正在对话时会等这一轮说完；会话已结束就自动开一轮新会话，播报后可以直接接着说。</p>
+    </div>
+    <p id="schedule-dialog-note" class="note err" role="alert"></p>
+    <div class="schedule-actions">
+      <button type="button" id="schedule-cancel">取消</button>
+      <button type="submit" id="schedule-submit" class="primary" disabled>创建</button>
+    </div>
+  </form>
 </dialog>
 
 
@@ -1254,6 +1377,281 @@ $("#voiceprint-form").addEventListener("submit", (event) => {
   updateVoiceprint("POST", {name, audio_url: voiceprintAudioUrl}, "已保存声纹：" + name);
 });
 
+// ---------------- 定时任务 ----------------
+// 任务存在 harness 数据库，到点由 harness 执行；改动立即生效，不走「保存并重启」。
+// 列表在页面加载、操作之后，以及 SSE 推来新的 revision（语音新建、到点执行等）时重取。
+const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
+let scheduleTasks = [];
+let scheduleRevision = null;
+let scheduleToday = "";      // 配置时区的今天，新建不重复的任务时做默认日期
+let scheduleEditing = null;  // 正在编辑的任务；null 是新建
+let scheduleSaving = false;
+
+function scheduleNote(text, ok) {
+  $("#schedule-note").textContent = text;
+  $("#schedule-note").className = "note " + (ok ? "ok" : "err");
+}
+
+async function scheduleApi(method, url, body) {
+  const options = { method };
+  if (body !== undefined) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+  return data;
+}
+
+async function loadSchedules() {
+  try {
+    const data = await scheduleApi("GET", "/api/schedules");
+    scheduleTasks = data.tasks || [];
+    scheduleToday = data.today || "";
+    $("#schedule-tz").textContent = data.timezone || "";
+    renderSchedules();
+  } catch (e) {
+    scheduleNote("加载定时任务失败：" + (e.message || e), false);
+  }
+}
+
+function renderScheduleState(state) {  // SSE 推来的调度状态：revision 变了就重取列表
+  $("#schedule-error").textContent = state.error || "";
+  if (state.revision === scheduleRevision) return;
+  scheduleRevision = state.revision;
+  loadSchedules();
+}
+
+function scheduleName(task) {
+  return task.title || task.prompt.split("\n")[0];
+}
+
+function renderSchedules() {
+  const tasks = scheduleTasks;
+  const enabled = tasks.filter((task) => task.enabled).length;
+  $("#schedule-count").textContent = " · " + (enabled === tasks.length ? tasks.length : enabled + "/" + tasks.length);
+  const open = new Set([...document.querySelectorAll("#schedule-rows .mcp-row.open")].map((row) => row.dataset.id));
+  $("#schedule-rows").replaceChildren(...tasks.map((task) => renderScheduleRow(task, open.has(String(task.id)))));
+  $("#schedule-empty").hidden = tasks.length > 0;
+}
+
+function renderScheduleRow(task, open) {
+  const row = el("div", "mcp-row" + (task.enabled ? "" : " off") + (open ? " open" : ""));
+  row.dataset.id = task.id;
+  const enabled = el("input");
+  enabled.type = "checkbox";
+  enabled.checked = task.enabled;
+  enabled.title = task.enabled ? "暂停" : "启用";
+  enabled.setAttribute("aria-label", (task.enabled ? "暂停：" : "启用：") + scheduleName(task));
+  enabled.addEventListener("change", () => toggleSchedule(task, enabled));
+  const name = el("span", "schedule-name", scheduleName(task));
+  name.title = task.prompt;
+  // 摘要行：还会执行的显示排期（上次失败的标出来），执行完、暂停、错过的显示状态
+  const upcoming = task.enabled && task.next_run;
+  const missed = !upcoming && task.enabled && ["已错过", "执行失败"].includes(task.status_text);
+  const state = el("span", "mcp-state" + (missed ? " err" : ""), upcoming ? task.summary : task.status_text);
+  if (upcoming && task.last_status === "error") state.append(el("span", "schedule-failed", " · 上次失败"));
+  state.title = task.status_text;
+  const summary = el("div", "mcp-summary");
+  summary.append(enabled, el("span", "mcp-arrow", "▶"), name, state);
+  summary.addEventListener("click", (event) => {  // 点摘要行展开/收起，点勾选框除外
+    if (event.target !== enabled) row.classList.toggle("open");
+  });
+
+  const meta = el("div", "schedule-meta");
+  meta.append(el("div", null, task.summary + " · " + task.status_text));
+  if (task.last_run_text) {
+    const result = { done: "已执行", missed: "已错过", error: "执行失败" }[task.last_status] || "";
+    meta.append(el("div", null, "上次 " + task.last_run_text + (result ? " · " + result : "")));
+  }
+  if (task.last_status === "error" && task.last_error) meta.append(el("div", "err", task.last_error));
+  const ops = el("div", "schedule-ops");
+  for (const [text, handler, cls] of [
+    ["立即运行", () => runSchedule(task)],
+    ["编辑", () => openScheduleDialog(task)],
+    ["删除", () => deleteSchedule(task), "danger"],
+  ]) {
+    const button = el("button", cls, text);
+    button.type = "button";
+    button.addEventListener("click", handler);
+    ops.append(button);
+  }
+  const body = el("div", "mcp-body");
+  body.append(el("div", "schedule-prompt", task.prompt), meta, ops);
+  row.append(summary, body);
+  return row;
+}
+
+async function toggleSchedule(task, box) {
+  box.disabled = true;
+  try {
+    await scheduleApi("PATCH", "/api/schedules/" + task.id, { enabled: box.checked });
+    scheduleNote((box.checked ? "已启用：" : "已暂停：") + scheduleName(task), true);
+  } catch (e) {
+    box.checked = !box.checked;
+    scheduleNote(e.message || String(e), false);
+  } finally {
+    box.disabled = false;
+    loadSchedules();
+  }
+}
+
+async function runSchedule(task) {
+  try {
+    await scheduleApi("POST", "/api/schedules/" + task.id + "/run");
+    scheduleNote("已触发「" + scheduleName(task) + "」，正在对话的话会等这一轮说完", true);
+  } catch (e) {
+    scheduleNote(e.message || String(e), false);
+  }
+}
+
+async function deleteSchedule(task) {
+  if (!confirm("删除定时任务「" + scheduleName(task) + "」？")) return;
+  try {
+    await scheduleApi("DELETE", "/api/schedules/" + task.id);
+    scheduleNote("已删除：" + scheduleName(task), true);
+  } catch (e) {
+    scheduleNote(e.message || String(e), false);
+  }
+  loadSchedules();
+}
+
+function selectedWeekdays() {
+  return [...document.querySelectorAll("#schedule-weekdays button")]
+    .filter((button) => button.getAttribute("aria-pressed") === "true")
+    .map((button) => Number(button.dataset.day));
+}
+
+function setWeekdays(days) {
+  for (const button of document.querySelectorAll("#schedule-weekdays button")) {
+    button.setAttribute("aria-pressed", String(days.includes(Number(button.dataset.day))));
+  }
+}
+
+function todayWeekday() {  // 配置时区的今天是星期几：1=周一 … 7=周日
+  const day = (scheduleToday ? new Date(scheduleToday + "T00:00:00") : new Date()).getDay();
+  return day === 0 ? 7 : day;
+}
+
+function setScheduleAdvanced(open) {
+  $("#schedule-advanced-body").hidden = !open;
+  $("#schedule-advanced").setAttribute("aria-expanded", String(open));
+}
+
+function syncScheduleForm() {  // 按重复方式切换日期、星期、时间、分钟几行，并决定能不能提交
+  const repeat = $("#schedule-repeat").value;
+  $("#schedule-date-row").hidden = repeat !== "once";
+  $("#schedule-weekdays-row").hidden = repeat !== "weekly";
+  $("#schedule-time-row").hidden = repeat === "hourly";
+  $("#schedule-minute-row").hidden = repeat !== "hourly";
+  if (repeat === "weekly" && !selectedWeekdays().length) setWeekdays([todayWeekday()]);
+  if (repeat === "once" && !$("#schedule-date").value) $("#schedule-date").value = scheduleToday;
+  const minute = $("#schedule-minute").value.trim();
+  const ready = $("#schedule-prompt").value.trim()
+    && (repeat === "hourly" ? /^\d{1,2}$/.test(minute) && Number(minute) <= 59 : $("#schedule-time").value)
+    && (repeat !== "once" || $("#schedule-date").value)
+    && (repeat !== "weekly" || selectedWeekdays().length);
+  $("#schedule-submit").disabled = scheduleSaving || !ready;
+}
+
+function scheduleFormChanged() {  // 改了表单就清掉上一次提交的报错
+  $("#schedule-dialog-note").textContent = "";
+  syncScheduleForm();
+}
+
+function openScheduleDialog(task = null) {
+  scheduleEditing = task;
+  const repeat = task ? task.repeat : "daily";
+  const time = task && repeat !== "hourly" ? task.time : "09:00";
+  $("#schedule-title").textContent = task ? "编辑定时任务" : "设置定时任务";
+  $("#schedule-submit").textContent = task ? "保存" : "创建";
+  $("#schedule-prompt").value = task ? task.prompt : "";
+  $("#schedule-repeat").value = repeat;
+  $("#schedule-time").step = time.length > 5 ? "1" : "60";  // 语音设的「几分钟后」带秒
+  $("#schedule-time").value = time;
+  $("#schedule-minute").value = task && repeat === "hourly" ? String(Number(task.time.slice(3, 5))) : "0";
+  $("#schedule-date").value = task && task.date ? task.date : scheduleToday;
+  setWeekdays(task ? task.weekdays : []);
+  $("#schedule-name").value = task ? task.title : "";
+  setScheduleAdvanced(Boolean(task && task.title));
+  $("#schedule-dialog-note").textContent = "";
+  syncScheduleForm();
+  $("#schedule-dialog").showModal();
+  $("#schedule-prompt").focus();
+}
+
+function scheduleFormValues() {
+  const repeat = $("#schedule-repeat").value;
+  const values = { prompt: $("#schedule-prompt").value.trim(), title: $("#schedule-name").value.trim(), repeat };
+  values.time = repeat === "hourly"
+    ? "00:" + String(Number($("#schedule-minute").value)).padStart(2, "0")
+    : $("#schedule-time").value;
+  if (repeat === "once") values.date = $("#schedule-date").value;
+  if (repeat === "weekly") values.weekdays = selectedWeekdays();
+  const old = scheduleEditing;
+  // 编辑时时间没动就不提交时间字段：只改说明或名称的话，已经执行过的一次性任务也能保存
+  if (old && repeat === old.repeat && values.time === old.time
+      && (repeat !== "once" || values.date === old.date)
+      && (repeat !== "weekly" || values.weekdays.join() === old.weekdays.join())) {
+    for (const key of ["repeat", "time", "date", "weekdays"]) delete values[key];
+  }
+  return values;
+}
+
+async function submitSchedule(event) {
+  event.preventDefault();
+  if (scheduleSaving || $("#schedule-submit").disabled) return;
+  const editing = scheduleEditing;
+  scheduleSaving = true;
+  syncScheduleForm();
+  $("#schedule-dialog-note").textContent = "";
+  try {
+    const values = scheduleFormValues();
+    const data = editing
+      ? await scheduleApi("PATCH", "/api/schedules/" + editing.id, values)
+      : await scheduleApi("POST", "/api/schedules", values);
+    $("#schedule-dialog").close();
+    $("#schedule-group").classList.add("open");
+    scheduleNote((editing ? "已保存：" : "已创建：") + scheduleName(data.task) + " · " + data.task.status_text, true);
+    loadSchedules();
+  } catch (e) {
+    $("#schedule-dialog-note").textContent = e.message || String(e);
+  } finally {
+    scheduleSaving = false;
+    syncScheduleForm();
+  }
+}
+
+$("#schedule-weekdays").replaceChildren(...WEEKDAY_LABELS.map((label, index) => {
+  const button = el("button", null, label);
+  button.type = "button";
+  button.dataset.day = index + 1;
+  button.setAttribute("aria-pressed", "false");
+  button.setAttribute("aria-label", "周" + label);
+  button.addEventListener("click", () => {
+    button.setAttribute("aria-pressed", String(button.getAttribute("aria-pressed") !== "true"));
+    scheduleFormChanged();
+  });
+  return button;
+}));
+$("#schedule-add").addEventListener("click", () => openScheduleDialog());
+$("#schedule-close").addEventListener("click", () => $("#schedule-dialog").close());
+$("#schedule-cancel").addEventListener("click", () => $("#schedule-dialog").close());
+$("#schedule-advanced").addEventListener("click", () => setScheduleAdvanced($("#schedule-advanced-body").hidden));
+$("#schedule-form").addEventListener("submit", submitSchedule);
+$("#schedule-form").addEventListener("input", scheduleFormChanged);
+$("#schedule-repeat").addEventListener("change", scheduleFormChanged);
+$("#schedule-prompt").addEventListener("keydown", (event) => {  // ⌘/Ctrl + Enter 直接创建
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.isComposing) {
+    event.preventDefault();
+    $("#schedule-form").requestSubmit();
+  }
+});
+// 「今天 / 明天」由服务端按当时的日期算好：页面开着过了零点或切回来时重取一次
+setInterval(() => { if (!document.hidden) loadSchedules(); }, 10 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) loadSchedules(); });
+
 
 // 完整状态只在页面加载、保存配置 / 重新开始、装完 MCP 包这几处取；跑起来会变的那部分走下面的 SSE
 async function loadState() {
@@ -1265,6 +1663,7 @@ async function loadState() {
     renderMcpStatus(fullState.mcp || []);
     renderSkills(fullState.skills || [], fullState.skills_dir);
     renderMessages(messages, fullState.compression);
+    if (fullState.schedules) renderScheduleState(fullState.schedules);
   } catch (e) { /* 进程没了，下次保存或重启时再取 */ }
 }
 
@@ -1423,6 +1822,7 @@ loadState().then(() => {
     messages = messages.slice(0, data.start).concat(data.messages);
     fullState = { ...fullState, ...data.status };
     if ($("#voiceprint-dialog").open) renderVoiceprints();
+    if (data.status.schedules) renderScheduleState(data.status.schedules);
     if (busy) return;  // 重启中的中间态（ChatBot 是 None，消息是空的）先收着不画，重启完会取完整状态
     renderStatus(fullState);
     renderMessages(messages, fullState.compression);
