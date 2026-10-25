@@ -1,8 +1,8 @@
 """定时任务的 stdio MCP server：让助手按用户的话新建、查看、修改和删除定时任务。
 
 任务由 harness 保存、到点执行（见 schedules.py）；这里只调用 harness 配置台的 /api/schedules 接口，
-和页面上的「定时任务」是同一份数据。配到 mcpServers 里即可（cwd 和 PATH 跟着 harness 走）：
-    {"定时任务": {"command": "python", "args": ["mcp/schedule_mcp.py"]}}
+和页面上的「定时任务」是同一份数据。harness 启动时自动用本 venv 的解释器加载本脚本
+（见 main.py 的 SCHEDULE_MCP_SERVER），不需要写进 config.json。
 """
 
 import json

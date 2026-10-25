@@ -767,7 +767,7 @@ function addDefaultMcpRow(item) {
   row.dataset.name = item.name;
   if (item.toggle) row.dataset.toggle = "1";  // 工具列表里渲染每个工具的启用勾选框
   const nameSpan = el("span", "mcp-name", item.name);
-  nameSpan.title = "SDK 自带工具的 MCP server，只读";
+  nameSpan.title = "内置的 MCP server，不走配置，只读";
   const summary = el("div", "mcp-summary");
   summary.append(el("span", "mcp-lock"), el("span", "mcp-arrow", "▶"), nameSpan, el("span", "mcp-type", "默认"), el("span", "mcp-state"));
   const body = el("div", "mcp-body");

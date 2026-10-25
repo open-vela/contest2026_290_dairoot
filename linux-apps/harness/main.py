@@ -49,6 +49,7 @@ from aichat_sdk.config import DEFAULT_AGENT_SOUL
 from aichat_sdk.llm import mcp as sdk_mcp
 from aichat_sdk.llm.mcp import (
     DEFAULT_TOOLS_SERVER,
+    add_mcp_server,
     get_mcp_server_status,
     register_default_tools_server,
     remove_mcp_server,
@@ -75,6 +76,10 @@ DIARY_FIRST_DELAY = 60  # 秒；启动后先等一会儿再整理日记，避开
 DIARY_INTERVAL = 3600  # 秒；之后每小时把新保存的会话整理进日记和记忆
 SCHEDULE_IDLE_WAIT = 60  # 秒；定时任务到点时正在对话，最多等这么久让这一轮说完再插进去
 SCHEDULE_MAX_SLEEP = 60  # 秒；调度循环没事也每分钟醒一次，系统时间被调过也能跟上
+# 定时任务的 MCP 是 harness 自带的，跟 SDK 的 aichat-tools 一样启动时自动注册、不写进 config.json，
+# 拉取代码后重启就有；MCP 配置里写了同名 server 时以配置为准（例如 enabled: false 关掉）。
+SCHEDULE_MCP_SERVER = "定时任务"
+SCHEDULE_MCP_SCRIPT = os.path.join(BASE_DIR, "mcp", "schedule_mcp.py")
 
 DEFAULT_CONFIG = {
     "tts_engine": DEFAULT_TTS_ENGINE,
@@ -91,13 +96,12 @@ DEFAULT_CONFIG = {
     # 外部 MCP server，格式同 AgentInfo.mcp；fetch 用 uvx 起在它自己的环境里——mcp-server-fetch 钉
     # mcp<2，装进本 venv 会跟 SDK 依赖的 fastmcp 要的 mcp>=2 打架（表现为 server 起不来报 ImportError）。
     # 本地 MCP 脚本统一放在 mcp/，依赖在 pyproject 里，直接用本 venv 的 python 起。
-    # python 靠 PATH 找到本 venv，脚本路径相对于 harness 工作目录。
+    # python 靠 PATH 找到本 venv，脚本路径相对于 harness 工作目录。定时任务是内置的，不在这里（见 SCHEDULE_MCP_SERVER）。
     "mcp": {
         "mcpServers": {
             "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
             "米家": {"command": "python", "args": ["mcp/miloco_mcp.py"]},
             "音量": {"command": "python", "args": ["mcp/volume_mcp.py"]},
-            "定时任务": {"command": "python", "args": ["mcp/schedule_mcp.py"]},
         }
     },
 }
@@ -702,6 +706,9 @@ class AIClient:
         enabled_skills = [skill["name"] for skill in self.skills if config["skills"].get(skill["name"], True)]
         # SDK 自带工具的开关：停用的工具作为 --disable 传给 aichat-tools server，不对模型提供
         register_default_tools_server(disabled_tools=sorted(disabled_aichat_tools(config)))
+        # 定时任务的 MCP 同样由这里注册：用本 venv 的解释器跑脚本的绝对路径，不依赖 config.json 和工作目录
+        if SCHEDULE_MCP_SERVER not in config["mcp"].get("mcpServers", {}):
+            add_mcp_server(SCHEDULE_MCP_SERVER, sys.executable, [SCHEDULE_MCP_SCRIPT])
         try:
             chat_bot = ChatBot(
                 voiceprints=self.voiceprints,
@@ -795,6 +802,11 @@ class AIClient:
         # 自带工具的开关变了也要重开 aichat-tools（--disable 在启动命令里，复用旧连接供的还是旧工具集）
         if disabled_aichat_tools(self.config) != disabled_aichat_tools(new_config):
             remove_mcp_server(DEFAULT_TOOLS_SERVER)
+        # 配置里加上或删掉同名「定时任务」时，在内置和配置的启动方式之间切换，旧连接要断开
+        old_all = self.config["mcp"].get("mcpServers", {})
+        new_all = new_config["mcp"].get("mcpServers", {})
+        if (SCHEDULE_MCP_SERVER in old_all) != (SCHEDULE_MCP_SERVER in new_all):
+            remove_mcp_server(SCHEDULE_MCP_SERVER)
 
     async def _stop_bot(self) -> None:
         task, chat_bot = self._play_task, self.chat_bot
