@@ -1,8 +1,9 @@
 """带 web 配置台的语音对话 demo（在 tests/test_run_v2.py 基础上加了 web 配置和查看）。
 
 音频照旧走本机：麦克风 sd.InputStream → ChatBot，TTS 音频 → sd.OutputStream；
-web 页面提供配置、聊天记录、声纹录入和 AI 日记；声纹保存在 harness 本机数据库。
+web 页面提供配置、聊天记录、声纹录入、定时任务和 AI 日记；声纹保存在 harness 本机数据库。
 后台每小时把新保存的会话整理成日记并更新长期记忆（见 diary.py），新会话开始时把记忆接在人设后面。
+定时任务到点时交给助手执行并播报（见 schedules.py），会话已结束就像唤醒词一样开一轮新会话。
 
 启动：python examples/web/main.py，然后打开 http://127.0.0.1:8080
 """
@@ -36,6 +37,7 @@ sys.path.insert(0, BASE_DIR)  # server.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(BASE_DIR)))  # aichat_sdk
 
 import diary
+import schedules
 from server import serve
 from session_store import get_session, query_sessions, save_debug_log, save_session
 from skill_install import MAX_OUTPUT_CHARS, install_skill, run_skill_command
@@ -71,6 +73,8 @@ DEFAULT_SPEAKER_VOLUME = 80  # 启动时把扬声器拉到这个音量；之后�
 PIP_INSTALL_TIMEOUT = 300  # 秒；pip 卡在网络上别让「安装中」永远转下去
 DIARY_FIRST_DELAY = 60  # 秒；启动后先等一会儿再整理日记，避开板上的启动高峰
 DIARY_INTERVAL = 3600  # 秒；之后每小时把新保存的会话整理进日记和记忆
+SCHEDULE_IDLE_WAIT = 60  # 秒；定时任务到点时正在对话，最多等这么久让这一轮说完再插进去
+SCHEDULE_MAX_SLEEP = 60  # 秒；调度循环没事也每分钟醒一次，系统时间被调过也能跟上
 
 DEFAULT_CONFIG = {
     "tts_engine": DEFAULT_TTS_ENGINE,
@@ -93,6 +97,7 @@ DEFAULT_CONFIG = {
             "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
             "米家": {"command": "python", "args": ["mcp/miloco_mcp.py"]},
             "音量": {"command": "python", "args": ["mcp/volume_mcp.py"]},
+            "定时任务": {"command": "python", "args": ["mcp/schedule_mcp.py"]},
         }
     },
 }
@@ -380,6 +385,11 @@ class AIClient:
                             "sessions": 0, "pending": 0, "skipped": 0}
         self._diary_wakeup = asyncio.Event()  # 页面点「立即整理」时唤醒后台循环
         self._diary_task: asyncio.Task | None = None
+        # 任务每次增删改或执行后 revision 加一，页面经 SSE 发现变化再重取列表；error 是调度循环自身的错误。
+        self.schedule_state = {"revision": 0, "error": ""}
+        self._schedule_wakeup = asyncio.Event()  # 任务有改动或要手动运行时唤醒调度循环重算
+        self._schedule_task: asyncio.Task | None = None
+        self._manual_runs: list[int] = []  # 页面点了「立即运行」、等调度循环执行的任务 id
 
     # ---------------- web 层用到的接口 ----------------
 
@@ -416,6 +426,52 @@ class AIClient:
         self._diary_wakeup.set()
         return dict(self.diary_state)
 
+    def _schedule_clock(self) -> tuple[datetime.datetime, datetime.timezone]:
+        """定时任务按配置时区解释：返回当前 UTC 时间和配置时区。"""
+        return datetime.datetime.now(datetime.timezone.utc), schedules.timezone_of(self.config["timezone"])
+
+    async def list_schedules(self) -> dict:
+        now, tz = self._schedule_clock()
+        tasks = await asyncio.to_thread(schedules.list_tasks, SESSION_DB_PATH, now=now, tz=tz)
+        return {"tasks": tasks, "timezone": schedules.timezone_label(self.config["timezone"]),
+                "today": now.astimezone(tz).date().isoformat()}
+
+    async def create_schedule(self, raw) -> dict:
+        now, tz = self._schedule_clock()
+        task = await asyncio.to_thread(schedules.create_task, SESSION_DB_PATH, raw, now=now, tz=tz)
+        self._schedules_changed()
+        return task
+
+    async def update_schedule(self, task_id: int, raw) -> dict:
+        now, tz = self._schedule_clock()
+        task = await asyncio.to_thread(schedules.update_task, SESSION_DB_PATH, task_id, raw, now=now, tz=tz)
+        self._schedules_changed()
+        return task
+
+    async def delete_schedule(self, task_id: int) -> None:
+        await asyncio.to_thread(schedules.delete_task, SESSION_DB_PATH, task_id)
+        self._schedules_changed()
+
+    async def run_schedule_now(self, task_id: int) -> dict:
+        """页面点「立即运行」：交给调度循环马上执行一次，不改变之后的排期。"""
+        now, tz = self._schedule_clock()
+        task = await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task_id, now=now, tz=tz)
+        if task is None:
+            raise schedules.TaskNotFound("定时任务不存在")
+        if task_id not in self._manual_runs:
+            self._manual_runs.append(task_id)
+        self._schedule_wakeup.set()
+        return task
+
+    def _bump_schedule_revision(self) -> None:
+        # 整体替换，SSE 才比较得出变化
+        self.schedule_state = {**self.schedule_state, "revision": self.schedule_state["revision"] + 1}
+
+    def _schedules_changed(self) -> None:
+        """任务有增删改：通知页面重取列表，并唤醒调度循环按新的排期重算。"""
+        self._bump_schedule_revision()
+        self._schedule_wakeup.set()
+
     def live_status(self) -> dict:
         """会话跑着自己就会变的那几项，走 SSE 推给页面。"""
         return {
@@ -429,6 +485,7 @@ class AIClient:
             "skill_install": dict(self.skill_install_state),
             "voiceprints": self.voiceprints.status(),
             "diary": dict(self.diary_state),
+            "schedules": dict(self.schedule_state),
         }
 
     def status(self) -> dict:
@@ -508,12 +565,15 @@ class AIClient:
             raise ValueError("ChatBot 没在运行，先修好配置或点「重新开始」")
         if self.is_session_closed:
             raise ValueError("会话已结束，点「重新开始」再聊")
+        self._start_text_task(chat_bot.send_text(text))
 
+    def _start_text_task(self, coroutine) -> None:
+        """在后台跑一轮 ChatBot.send_text：手打的文本和到点的定时任务都走这里。"""
         # 立刻停拾音，别让接下来扬声器里的回答被麦克风收回去（play_audio 收到 stt 也会置位，
         # 但那要等 send_text 真的跑起来）
         self.is_playing = True
         # send_text 要等整轮回答说完才返回，这里不等：HTTP 立刻返回，页面照旧轮询看消息
-        task = asyncio.create_task(chat_bot.send_text(text))
+        task = asyncio.create_task(coroutine)
         self._text_tasks.add(task)
         task.add_done_callback(self._finish_text_task)
 
@@ -792,6 +852,82 @@ class AIClient:
             await self.update_diary()
             delay = DIARY_INTERVAL
 
+    # ---------------- 定时任务 ----------------
+
+    async def _schedule_loop(self) -> None:
+        """睡到最近一次执行时间再执行到点的任务；任务有改动或要手动运行时立即重算。
+
+        只有这一个任务执行定时任务，执行不会重叠；执行完马上重算下一次。
+        """
+        while True:
+            self._schedule_wakeup.clear()
+            delay = SCHEDULE_MAX_SLEEP
+            try:
+                now, tz = self._schedule_clock()
+                due, wake_at = await asyncio.to_thread(schedules.collect_due, SESSION_DB_PATH, now=now, tz=tz)
+                runs: list[tuple[dict, datetime.datetime | None]] = list(due)
+                manual, self._manual_runs = self._manual_runs, []
+                for task_id in manual:
+                    task = await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task_id, now=now, tz=tz)
+                    if task is not None and all(task["id"] != item["id"] for item, _ in runs):
+                        runs.append((task, None))  # None：手动运行，按实际运行时刻记录
+                if self.schedule_state["error"]:
+                    self.schedule_state = {**self.schedule_state, "error": ""}
+                if runs:
+                    await self._run_scheduled(runs)
+                    continue
+                if wake_at is not None:
+                    left = (wake_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                    delay = min(delay, max(0.0, left))
+            except (OSError, SQLAlchemyError, ValueError, TypeError):
+                logger.exception("定时任务调度失败")
+                self.schedule_state = {**self.schedule_state, "error": "定时任务读取或保存失败，详见服务日志"}
+            try:
+                await asyncio.wait_for(self._schedule_wakeup.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _wait_until_idle(self, timeout: float) -> None:
+        """等当前这一轮对话说完（最多 timeout 秒），免得定时任务插在用户和助手中间。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (self.is_restarting or self.is_playing or self._text_tasks) and loop.time() < deadline:
+            await asyncio.sleep(0.5)
+
+    async def _run_scheduled(self, runs: list[tuple[dict, datetime.datetime | None]]) -> None:
+        """让助手执行到点（或手动运行）的任务：同一时刻的合成一条消息，会话已结束就开一轮新会话。
+
+        先记下执行时间再交给 ChatBot：记录写不进去就不执行，同一次不会重复播报。
+        """
+        await self._wait_until_idle(SCHEDULE_IDLE_WAIT)
+        started = datetime.datetime.now(datetime.timezone.utc)
+        marks = [(task["id"], occurrence or started) for task, occurrence in runs]
+        await asyncio.to_thread(schedules.mark_runs, SESSION_DB_PATH, marks, status="done")
+        names = "、".join(task["title"] or task["prompt"][:20] for task, _ in runs)
+        error = ""
+        try:
+            if self.chat_bot is None or self.is_session_closed:
+                await self.restart()  # 跟唤醒词一样开一轮新会话，说完用户还能接着回话
+            chat_bot = self.chat_bot
+            if chat_bot is None:
+                error = self.last_error or "对话服务没有运行"
+            else:
+                self._start_text_task(chat_bot.send_text(
+                    schedules.trigger_text([task for task, _ in runs]),
+                    response_instructions=schedules.TRIGGER_INSTRUCTIONS,
+                ))
+                logger.info("[schedule] 执行定时任务：%s", names)
+        except Exception:
+            logger.exception("执行定时任务失败")
+            error = "执行失败，详见服务日志"
+        if error:
+            logger.error("[schedule] 定时任务没能执行（%s）：%s", names, error)
+            try:
+                await asyncio.to_thread(schedules.mark_runs, SESSION_DB_PATH, marks, status="error", error=error)
+            except (OSError, SQLAlchemyError):
+                logger.exception("记录定时任务失败原因失败")
+        self._bump_schedule_revision()
+
     # ---------------- 音频 ----------------
 
     async def play_audio(self, chat_bot: ChatBot):
@@ -874,12 +1010,15 @@ class AIClient:
         try:
             self._diary_task = asyncio.create_task(self._diary_loop())
             await self.restart()  # 拾音流在里面按配置开，换设备保存后一起重开
+            # 首轮会话起来之后再调度：到点的任务要开新会话时，不会和这里的首次启动同时重启
+            self._schedule_task = asyncio.create_task(self._schedule_loop())
             print(f"web 配置台: http://{WEB_HOST}:{WEB_PORT}    聆听中... (Ctrl+C 退出)")
             await serve(self, WEB_HOST, WEB_PORT)
         finally:
-            if self._diary_task is not None:
-                self._diary_task.cancel()
-                await asyncio.gather(self._diary_task, return_exceptions=True)
+            for task in (self._diary_task, self._schedule_task):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             async with self._lock:
                 await self._stop_bot()
             self._close_input_stream()

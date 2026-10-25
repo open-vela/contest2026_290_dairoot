@@ -80,6 +80,7 @@ MiMo 需在 `.env` 配置 `MIMO_API_KEY`，可选 `MIMO_TTS_VOICE`（默认 `mim
 
 - `mcp/miloco_mcp.py`：米家设备和摄像头，读取 harness 根目录的 `.env`。
 - `mcp/volume_mcp.py`：本机扬声器音量。
+- `mcp/schedule_mcp.py`：定时任务，调用 harness 本机的定时任务接口，见[定时任务](#定时任务)。
 
 配置中的脚本路径相对于 harness 目录；MCP 服务列表以保存的配置为准。
 
@@ -265,8 +266,7 @@ uv run python -m unittest -v tests.test_skill_install
 所以每次重启都会覆盖上一轮对话调过的音量；`pactl` 缺失或音频服务没起来时
 只记一条 warning，不影响对话启动。
 
-“音量”服务默认启用，已有 `config.json` 缺少该项时也会自动补上。
-如果在配置台明确设置 `enabled: false`，启动时会保留禁用状态。对应配置为：
+“音量”服务在默认配置中启用；已有 `config.json` 不会自动补上，需要时在配置台的 MCP servers 里添加：
 
 ```json
 "音量": {"command": "python", "args": ["mcp/volume_mcp.py"]}
@@ -289,6 +289,59 @@ uv run python -m unittest -v tests.test_skill_install
 
 ```bash
 uv run python -m unittest -v tests.test_volume_mcp
+```
+
+## 定时任务
+
+到点时助手自动执行一段说明并播报，例如「每天早上八点播报天气」「十分钟后提醒我关火」。
+可以直接对助手说，也可以在配置台「定时任务」分区点「+ 新建」，在「设置定时任务」弹窗里填写说明、
+重复方式和时间。改动立即生效，不需要保存并重启。实现见 [`schedules.py`](schedules.py)。
+
+- 重复方式：不重复（指定日期）、每小时（第几分）、每天、工作日（周一到周五）、每周（选星期几）。
+  时间按 `config.json` 的时区解释，弹窗在时间旁显示该时区。
+- 到点时，说明以一条 `【定时任务】` 开头的消息交给助手，需要时调用工具，然后用一两句话播报；
+  同一时刻到点的任务合成一条消息。会话已结束时像唤醒词一样开一轮新会话，播报后可以直接接着说；
+  正在对话时最多等 60 秒让这一轮说完，再接在当前会话里执行。
+- harness 当时没在运行（关机、重启中）：15 分钟以内的照常补执行，更早的记为「已错过」，不再补。
+  暂停后恢复或修改后，从改动的时刻往后找下一次，不补之前的时间点。
+- 列表里可以暂停 / 启用、编辑、删除和「立即运行」，立即运行不影响之后的排期。
+  执行失败（例如 TTS 未配置、ASR 未启动）时任务上显示原因，详细错误见服务日志。
+- 历史会话里这条触发消息显示为用户消息；AI 日记把它记作「定时任务」，只有提醒、没人回话的会话不写日记。
+- 最多 50 个任务，说明最多 500 字。与配置台其他接口一样没有鉴权，同网段都能查看和修改。
+
+`mcp/schedule_mcp.py`（配置名「定时任务」）把这些操作提供给模型：`create_scheduled_task`、
+`list_scheduled_tasks`、`update_scheduled_task` 和 `delete_scheduled_task`。它通过本机
+`http://127.0.0.1:8080/api/schedules` 读写，与配置台是同一份数据，语音新建的任务会实时出现在页面上。
+「X 分钟后」用 `in_minutes`；不重复的任务不填日期时，取这个时间下一次到来的那天（今天已过就是明天）。
+默认配置已包含该服务；已有 `config.json` 不会自动补上，需要时在配置台的 MCP servers 里添加：
+
+```json
+"定时任务": {"command": "python", "args": ["mcp/schedule_mcp.py"]}
+```
+
+接口（配置台和 MCP 共用）：
+
+- `GET /api/schedules`：返回 `tasks`、配置时区 `timezone`（如 `UTC+8`）和配置时区的今天 `today`。
+  每个任务含 `id`、`title`、`prompt`、`repeat`（`once` / `hourly` / `daily` / `weekdays` / `weekly`）、
+  `time`、`date`、`weekdays`、`enabled`，以及 `summary`、`next_run`、`status_text`、`last_run_text`、
+  `last_status`（`done` / `missed` / `error`）和 `last_error`。
+- `POST /api/schedules`：新建，例如 `{"prompt":"查询深圳今天的天气并播报","repeat":"weekdays","time":"08:00"}`；
+  每周的任务加 `weekdays`（1=周一 … 7=周日），不重复的可加 `date`，或用 `in_minutes` 表示多少分钟后。
+- `PATCH /api/schedules/{id}`：只改提交的字段，例如 `{"enabled": false}` 暂停。
+- `DELETE /api/schedules/{id}`：删除；`POST /api/schedules/{id}/run`：马上执行一次。
+- 参数不合法返回 400，任务不存在返回 404，数据库不可读返回 503；任务每次变化或执行后，
+  `/api/state` 和 `/api/events` 的 `status.schedules.revision` 加一，页面据此刷新列表。
+
+任务保存在 `data/db.sqlite3` 的 `scheduled_tasks` 表，和其他表一样在首次写入数据库时自动创建：
+
+```bash
+sqlite3 data/db.sqlite3 'SELECT id, repeat, time, date, enabled, last_run_at, last_status FROM scheduled_tasks;'
+```
+
+测试（临时数据库与模拟 ChatBot；MCP 经测试客户端调用真实接口，不访问音频或网络）：
+
+```bash
+uv run python -m unittest -v tests.test_schedules
 ```
 
 ## 测试

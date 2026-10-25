@@ -20,6 +20,11 @@
 - POST /api/diaries/update  唤醒后台马上整理一轮日记和记忆，进度见 status.diary
 - GET  /api/memory   当前长期记忆
 - PUT  /api/memory   保存页面修改的记忆（空串即清空），下次会话生效
+- GET  /api/schedules  定时任务列表、配置时区和今天的日期
+- POST /api/schedules  新建定时任务（配置台和定时任务 MCP 共用），立即生效
+- PATCH /api/schedules/{id}  修改定时任务，只改提交的字段
+- DELETE /api/schedules/{id}  删除定时任务
+- POST /api/schedules/{id}/run  马上执行一次，不改变之后的排期
 - GET  /audio/...    转发到 ASR 服务上的用户录音（见 get_audio）
 """
 
@@ -41,6 +46,7 @@ from starlette.routing import Route
 from sqlalchemy.exc import SQLAlchemyError
 
 from aichat_sdk.config import ASR_SERVER_WS_URL
+from schedules import TaskNotFound
 from skill_install import MAX_UPLOAD_BYTES
 
 INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
@@ -219,6 +225,41 @@ def create_app(client) -> Starlette:
             return JSONResponse({"ok": False, "error": "保存记忆失败，请检查数据库"}, status_code=503)
         return JSONResponse({"ok": True, "memory": memory})
 
+    async def get_schedules(request: Request):
+        try:
+            data = await client.list_schedules()
+        except (OSError, SQLAlchemyError):
+            logger.exception("查询定时任务失败")
+            return JSONResponse({"ok": False, "error": "定时任务暂时不可用，请稍后重试"}, status_code=503)
+        return JSONResponse({"ok": True, **data}, headers={"Cache-Control": "no-store"})
+
+    async def change_schedule(request: Request):
+        """新建（POST）、修改（PATCH）、删除（DELETE）和立即运行（POST …/run）共用的错误处理。"""
+        task_id = request.path_params.get("task_id")
+        try:
+            if request.method == "DELETE":
+                await client.delete_schedule(task_id)
+                return JSONResponse({"ok": True})
+            if request.url.path.endswith("/run"):
+                task = await client.run_schedule_now(task_id)
+            else:
+                try:
+                    body = await request.json()
+                except json.JSONDecodeError:
+                    raise ValueError("请求需要 JSON 对象") from None
+                if task_id is None:
+                    task = await client.create_schedule(body)
+                else:
+                    task = await client.update_schedule(task_id, body)
+        except TaskNotFound as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except (OSError, SQLAlchemyError):
+            logger.exception("保存定时任务失败")
+            return JSONResponse({"ok": False, "error": "保存定时任务失败，请检查数据库"}, status_code=503)
+        return JSONResponse({"ok": True, "task": task})
+
     async def get_events(request: Request):
         """状态和新消息的 SSE 流：ChatBot 没有变更回调，服务端自己看着，变了才发一帧。
 
@@ -283,6 +324,10 @@ def create_app(client) -> Starlette:
             Route("/api/diaries/update", post_diary_update, methods=["POST"]),
             Route("/api/memory", get_memory),
             Route("/api/memory", put_memory, methods=["PUT"]),
+            Route("/api/schedules", get_schedules),
+            Route("/api/schedules", change_schedule, methods=["POST"]),
+            Route("/api/schedules/{task_id:int}", change_schedule, methods=["PATCH", "DELETE"]),
+            Route("/api/schedules/{task_id:int}/run", change_schedule, methods=["POST"]),
             Route("/audio/{path:path}", get_audio),
         ]
     )
