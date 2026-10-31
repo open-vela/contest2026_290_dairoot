@@ -41,9 +41,10 @@ import schedules
 from server import serve
 from session_store import get_session, query_sessions, save_debug_log, save_session
 from skill_install import MAX_OUTPUT_CHARS, install_skill, run_skill_command
+from conversation import ConversationQueue, HarnessChatBot as ChatBot, Message
 
 from aichat_sdk import DEFAULT_TTS_ENGINE, get_tts_engines
-from voiceprint import VoiceprintChatBot as ChatBot, VoiceprintClient
+from voiceprint import VoiceprintClient
 from aichat_sdk import config as sdk_config
 from aichat_sdk.config import DEFAULT_AGENT_SOUL
 from aichat_sdk.llm import mcp as sdk_mcp
@@ -74,7 +75,6 @@ DEFAULT_SPEAKER_VOLUME = 80  # 启动时把扬声器拉到这个音量；之后�
 PIP_INSTALL_TIMEOUT = 300  # 秒；pip 卡在网络上别让「安装中」永远转下去
 DIARY_FIRST_DELAY = 60  # 秒；启动后先等一会儿再整理日记，避开板上的启动高峰
 DIARY_INTERVAL = 3600  # 秒；之后每小时把新保存的会话整理进日记和记忆
-SCHEDULE_IDLE_WAIT = 60  # 秒；定时任务到点时正在对话，最多等这么久让这一轮说完再插进去
 SCHEDULE_MAX_SLEEP = 60  # 秒；调度循环没事也每分钟醒一次，系统时间被调过也能跟上
 # 定时任务的 MCP 是 harness 自带的，跟 SDK 的 aichat-tools 一样启动时自动注册、不写进 config.json，
 # 拉取代码后重启就有；MCP 配置里写了同名 server 时以配置为准（例如 enabled: false 关掉）。
@@ -378,8 +378,12 @@ class AIClient:
         self._messages_saved = False
         self._debug_log_saved = False
         self._play_task: asyncio.Task | None = None
-        self._text_tasks: set[asyncio.Task] = set()
+        self.conversation = ConversationQueue(self._execute_message, self._finish_message, self._conversation_idle)
+        self.is_stopping = False
+        self._schedule_submit_lock = asyncio.Lock()
+        self._schedule_results: list[tuple[list, str, str]] = []
         self._output_stream: sd.OutputStream | None = None
+        self._output_write: asyncio.Task | None = None
         self._input_stream: sd.InputStream | None = None
         self._lock = asyncio.Lock()
         self._skill_install_lock = asyncio.Lock()
@@ -393,7 +397,6 @@ class AIClient:
         self.schedule_state = {"revision": 0, "error": ""}
         self._schedule_wakeup = asyncio.Event()  # 任务有改动或要手动运行时唤醒调度循环重算
         self._schedule_task: asyncio.Task | None = None
-        self._manual_runs: list[int] = []  # 页面点了「立即运行」、等调度循环执行的任务 id
 
     # ---------------- web 层用到的接口 ----------------
 
@@ -457,15 +460,13 @@ class AIClient:
         self._schedules_changed()
 
     async def run_schedule_now(self, task_id: int) -> dict:
-        """页面点「立即运行」：交给调度循环马上执行一次，不改变之后的排期。"""
+        """立即排入同一个消息队列，不改变之后的排期；已有执行时不重复提交。"""
         now, tz = self._schedule_clock()
         task = await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task_id, now=now, tz=tz)
         if task is None:
             raise schedules.TaskNotFound("定时任务不存在")
-        if task_id not in self._manual_runs:
-            self._manual_runs.append(task_id)
-        self._schedule_wakeup.set()
-        return task
+        await self._run_scheduled([(task, None)])
+        return await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task_id, now=now, tz=tz)
 
     def _bump_schedule_revision(self) -> None:
         # 整体替换，SSE 才比较得出变化
@@ -483,6 +484,7 @@ class AIClient:
             "restarting": self.is_restarting,
             "session_closed": self.is_session_closed,
             "speaking": self.is_playing,
+            "conversation": self.conversation_status(),
             "round": self.chat_bot.llm.round if self.chat_bot else 0,
             "error": self.last_error,
             "compression": self.compression_status(),
@@ -559,36 +561,143 @@ class AIClient:
             )
         return rows
 
-    async def send_text(self, text: str) -> None:
+    async def send_text(self, text: str) -> dict:
         """页面手打的文本，走跟 ASR 识别结果一样的链路（照样会出声）；不合法就抛 ValueError 给页面。"""
+        if not isinstance(text, str):
+            raise ValueError("消息需要是字符串")
         text = text.strip()
         if not text:
             raise ValueError("消息不能为空")
         chat_bot = self.chat_bot
-        if chat_bot is None or self.is_restarting:
+        if chat_bot is None or self.is_restarting or self.is_stopping:
             raise ValueError("ChatBot 没在运行，先修好配置或点「重新开始」")
         if self.is_session_closed:
             raise ValueError("会话已结束，点「重新开始」再聊")
-        self._start_text_task(chat_bot.send_text(text))
+        return self.conversation.enqueue(Message(text))
 
-    def _start_text_task(self, coroutine) -> None:
-        """在后台跑一轮 ChatBot.send_text：手打的文本和到点的定时任务都走这里。"""
-        # 立刻停拾音，别让接下来扬声器里的回答被麦克风收回去（play_audio 收到 stt 也会置位，
-        # 但那要等 send_text 真的跑起来）
-        self.is_playing = True
-        # send_text 要等整轮回答说完才返回，这里不等：HTTP 立刻返回，页面照旧轮询看消息
-        task = asyncio.create_task(coroutine)
-        self._text_tasks.add(task)
-        task.add_done_callback(self._finish_text_task)
+    async def _submit_sdk_text(self, chat_bot, text, **kwargs):
+        if chat_bot is not self.chat_bot or self.is_restarting or self.is_stopping:
+            return  # 重启/停止期间到达的旧 ASR 结果不能进入新一轮。
+        self.conversation.enqueue(Message(text, "voice" if kwargs.get("audio_url") else "system", kwargs))
 
-    def _finish_text_task(self, task: asyncio.Task) -> None:
-        self._text_tasks.discard(task)
-        if task.cancelled():
+    def _conversation_busy(self):
+        return bool(self.conversation.active or self.conversation.pending or self.conversation.paused or self.is_stopping)
+
+    def conversation_status(self):
+        return {**self.conversation.status(), "stopping": self.is_stopping}
+
+    def _conversation_idle(self):
+        if self.chat_bot is not None and not self.is_session_closed:
+            self.chat_bot.arm_idle_timer()
+
+    async def _schedule_status(self, runs, status, error="", *, finishing=False):
+        if not runs:
             return
-        error = task.exception()
-        if error is not None:
-            self.is_playing = False  # 兜底：这轮没能正常播完，别把拾音一直关着
-            logger.error("发送文本失败", exc_info=(type(error), error, error.__traceback__))
+        # SQLite 在线程中写入。取消必须等事务退出，避免迟到的 running 覆盖 cancelled。
+        write = asyncio.create_task(asyncio.to_thread(
+            schedules.mark_runs, SESSION_DB_PATH, runs, status=status, error=error, finishing=finishing,
+        ))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            raise
+        self._bump_schedule_revision()
+
+    async def _execute_message(self, message):
+        await self._schedule_status(message.runs, "running", finishing=True)
+        if self.chat_bot is None or self.is_session_closed:
+            await self.restart(keep_queue=True)
+        chat_bot = self.chat_bot
+        if chat_bot is None:
+            raise RuntimeError(self.last_error or "对话服务没有运行")
+        self.is_playing = True
+        reply = asyncio.create_task(chat_bot.execute_text(message.text, **message.kwargs))
+        try:
+            try:
+                playback = self._play_task
+                if playback is not None:
+                    done, _ = await asyncio.wait({reply, playback}, return_when=asyncio.FIRST_COMPLETED)
+                    if playback in done:
+                        playback.result()  # 解码或输出设备异常必须进入失败状态，不能永远等播放栅栏。
+                        if not self.is_session_closed:
+                            raise RuntimeError("音频播放循环已停止")
+                await reply
+            finally:
+                if not reply.done():
+                    reply.cancel()
+                    await asyncio.gather(reply, return_exceptions=True)
+        except Exception:
+            if self._play_task is not None:
+                await self._reset_playback(chat_bot)
+            raise
+        finally:
+            self.is_playing = False
+
+    async def _finish_message(self, message, status, error):
+        try:
+            await self._schedule_status(message.runs, status, error, finishing=True)
+        except (OSError, SQLAlchemyError):
+            self._schedule_results.append((message.runs, status, error))
+            self.schedule_state = {**self.schedule_state, "error": "执行结果保存失败，详见服务日志"}
+            raise
+
+    async def _retry_schedule_results(self):
+        while self._schedule_results:
+            runs, status, error = self._schedule_results[0]
+            await self._schedule_status(runs, status, error, finishing=True)
+            self._schedule_results.pop(0)
+
+    async def _reset_playback(self, chat_bot):
+        if self._play_task is not None:
+            self._play_task.cancel()
+            await asyncio.gather(self._play_task, return_exceptions=True)
+            self._play_task = None
+        await chat_bot.abort()
+        await self._flush_output()
+        if not self.is_session_closed:
+            self._play_task = asyncio.create_task(self.play_audio(chat_bot))
+
+    async def _flush_output(self):
+        if self._output_stream is not None:
+            await asyncio.to_thread(self._output_stream.abort)
+            # 取消 asyncio 等待不会停止 PortAudio 写线程。先 abort 让它退出，再重开输出。
+            if self._output_write is not None:
+                await asyncio.gather(self._output_write, return_exceptions=True)
+                self._output_write = None
+            await asyncio.to_thread(self._output_stream.start)
+
+    async def _write_audio(self, data):
+        write = asyncio.create_task(asyncio.to_thread(self._output_stream.write, data))
+        self._output_write = write
+        try:
+            await asyncio.shield(write)
+        finally:
+            if write.done():
+                self._output_write = None
+
+    async def stop_reply(self):
+        """停止生成与播放并暂停队列；保留当前会话和待发消息。"""
+        async with self._lock:
+            self.is_stopping = True
+            try:
+                await self.conversation.stop()
+                chat_bot = self.chat_bot
+                if chat_bot is not None:
+                    await self._reset_playback(chat_bot)
+            finally:
+                self.is_playing, self.is_stopping = False, False
+        return self.conversation_status()
+
+    async def resume_messages(self):
+        if self.is_restarting or self.is_stopping:
+            raise ValueError("请等待停止或重启完成")
+        self.conversation.resume()
+        return self.conversation_status()
+
+    async def clear_messages(self):
+        await self.conversation.clear()
+        return self.conversation_status()
 
     def messages(self) -> list[dict]:
         return self.chat_bot.llm.messages if self.chat_bot else []
@@ -669,11 +778,11 @@ class AIClient:
         await self.restart()  # _start_bot 会让工具列表重建，连不上的 server 这次会重试
         return package
 
-    async def restart(self, config: dict | None = None) -> None:
+    async def restart(self, config: dict | None = None, *, keep_queue=False) -> None:
         async with self._lock:
             self.is_restarting = True
             try:
-                await self._stop_bot()
+                await self._stop_bot(stop_conversation=not keep_queue)
                 if config is not None:
                     self._sync_mcp_registry(config)  # 必须在 self.config 被换掉之前，要拿旧配置做差异
                     self.config = config
@@ -712,6 +821,8 @@ class AIClient:
         try:
             chat_bot = ChatBot(
                 voiceprints=self.voiceprints,
+                submit_text=self._submit_sdk_text,
+                conversation_busy=self._conversation_busy,
                 tts_engine=config["tts_engine"],
                 output_sample_rate=OUTPUT_SAMPLE_RATE,
                 send_idle_farewell=config["send_idle_farewell"],
@@ -808,17 +919,16 @@ class AIClient:
         if (SCHEDULE_MCP_SERVER in old_all) != (SCHEDULE_MCP_SERVER in new_all):
             remove_mcp_server(SCHEDULE_MCP_SERVER)
 
-    async def _stop_bot(self) -> None:
+    async def _stop_bot(self, *, stop_conversation=True) -> None:
+        if stop_conversation:
+            await self.conversation.reset()
         task, chat_bot = self._play_task, self.chat_bot
         self._play_task, self.chat_bot = None, None
-        for text_task in self._text_tasks:
-            text_task.cancel()
-        if self._text_tasks:
-            await asyncio.gather(*self._text_tasks, return_exceptions=True)
-        self._text_tasks.clear()
-        if task is not None and not task.done():
-            task.cancel()
+        if task is not None:
+            if not task.done():
+                task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await self._flush_output()
         if chat_bot is not None:
             try:
                 await chat_bot.close()
@@ -875,14 +985,10 @@ class AIClient:
             self._schedule_wakeup.clear()
             delay = SCHEDULE_MAX_SLEEP
             try:
+                await self._retry_schedule_results()
                 now, tz = self._schedule_clock()
                 due, wake_at = await asyncio.to_thread(schedules.collect_due, SESSION_DB_PATH, now=now, tz=tz)
                 runs: list[tuple[dict, datetime.datetime | None]] = list(due)
-                manual, self._manual_runs = self._manual_runs, []
-                for task_id in manual:
-                    task = await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task_id, now=now, tz=tz)
-                    if task is not None and all(task["id"] != item["id"] for item, _ in runs):
-                        runs.append((task, None))  # None：手动运行，按实际运行时刻记录
                 if self.schedule_state["error"]:
                     self.schedule_state = {**self.schedule_state, "error": ""}
                 if runs:
@@ -899,46 +1005,37 @@ class AIClient:
             except asyncio.TimeoutError:
                 pass
 
-    async def _wait_until_idle(self, timeout: float) -> None:
-        """等当前这一轮对话说完（最多 timeout 秒），免得定时任务插在用户和助手中间。"""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while (self.is_restarting or self.is_playing or self._text_tasks) and loop.time() < deadline:
-            await asyncio.sleep(0.5)
-
     async def _run_scheduled(self, runs: list[tuple[dict, datetime.datetime | None]]) -> None:
-        """让助手执行到点（或手动运行）的任务：同一时刻的合成一条消息，会话已结束就开一轮新会话。
-
-        先记下执行时间再交给 ChatBot：记录写不进去就不执行，同一次不会重复播报。
-        """
-        await self._wait_until_idle(SCHEDULE_IDLE_WAIT)
-        started = datetime.datetime.now(datetime.timezone.utc)
-        marks = [(task["id"], occurrence or started) for task, occurrence in runs]
-        await asyncio.to_thread(schedules.mark_runs, SESSION_DB_PATH, marks, status="done")
-        names = "、".join(task["title"] or task["prompt"][:20] for task, _ in runs)
-        error = ""
-        try:
-            if self.chat_bot is None or self.is_session_closed:
-                await self.restart()  # 跟唤醒词一样开一轮新会话，说完用户还能接着回话
-            chat_bot = self.chat_bot
-            if chat_bot is None:
-                error = self.last_error or "对话服务没有运行"
-            else:
-                self._start_text_task(chat_bot.send_text(
-                    schedules.trigger_text([task for task, _ in runs]),
-                    response_instructions=schedules.TRIGGER_INSTRUCTIONS,
-                ))
-                logger.info("[schedule] 执行定时任务：%s", names)
-        except Exception:
-            logger.exception("执行定时任务失败")
-            error = "执行失败，详见服务日志"
-        if error:
-            logger.error("[schedule] 定时任务没能执行（%s）：%s", names, error)
+        """先持久化排队状态占住本次计划时间，再入队；完成和失败由执行回调落库。"""
+        async with self._schedule_submit_lock:
+            now, tz = self._schedule_clock()
+            fresh = []
+            for task, occurrence in runs:
+                current = await asyncio.to_thread(schedules.get_task, SESSION_DB_PATH, task["id"], now=now, tz=tz)
+                if current is None or current["last_status"] in schedules.ACTIVE_STATUSES:
+                    continue
+                # 自动触发与手动触发并发时，已记录的同一次 occurrence 不得重复入队。
+                if occurrence is not None and current["last_run_at"] and (
+                    datetime.datetime.fromisoformat(current["last_run_at"]) >= occurrence
+                ):
+                    continue
+                fresh.append((current, occurrence or now))
+            if not fresh:
+                return
+            self.conversation.check_capacity()
+            marks = [(task["id"], occurrence) for task, occurrence in fresh]
             try:
-                await asyncio.to_thread(schedules.mark_runs, SESSION_DB_PATH, marks, status="error", error=error)
-            except (OSError, SQLAlchemyError):
-                logger.exception("记录定时任务失败原因失败")
-        self._bump_schedule_revision()
+                await self._schedule_status(marks, "queued")
+                self.conversation.enqueue(Message(
+                    schedules.trigger_text([task for task, _ in fresh]), "schedule",
+                    {"response_instructions": schedules.TRIGGER_INSTRUCTIONS}, marks,
+                ))
+            except asyncio.CancelledError:
+                await self._schedule_status(marks, "cancelled", "入队因服务退出而中断", finishing=True)
+                raise
+            except ValueError as exc:
+                await self._schedule_status(marks, "error", str(exc), finishing=True)
+                raise
 
     # ---------------- 音频 ----------------
 
@@ -954,7 +1051,14 @@ class AIClient:
                 self.is_session_closed = True
                 self.is_playing = False
                 logger.info("[session] 会话结束，停止拾音；页面点「重新开始」再开一轮")
-                return
+                if self.conversation.active is None:
+                    return
+
+            elif item.get("type") == "turn_finish":
+                if not item["played"].done():
+                    item["played"].set_result(None)
+                if self.is_session_closed:
+                    return
 
             elif item.get("type") == "audio_finish":
                 await asyncio.sleep(0.3)
@@ -971,12 +1075,10 @@ class AIClient:
                 if prime:
                     # 句首 TTS 网络流还没跑到实时速率，先写 200ms 静音把输出缓冲
                     # 灌到安全水位——供数毛刺落在静音里，而不是打碎前几个字
-                    await asyncio.to_thread(
-                        self._output_stream.write,
-                        np.zeros(int(OUTPUT_SAMPLE_RATE * 0.2), dtype=np.int16))
+                    await self._write_audio(np.zeros(int(OUTPUT_SAMPLE_RATE * 0.2), dtype=np.int16))
                     prime = False
                 # 写扬声器按实时速率阻塞，放线程里，不然一说话 web 就卡住不响应
-                await asyncio.to_thread(self._output_stream.write, audio_array)
+                await self._write_audio(audio_array)
 
     def _open_input_stream(self) -> None:
         """按配置的设备开拾音流（换设备只能关了重开）；打不开就记进 last_error，页面还能再挑一个。"""
@@ -1008,7 +1110,7 @@ class AIClient:
         chat_bot = self.chat_bot
         # 会话结束后就别再拾音了：bot 还留着（页面要看 llm.messages），但 play_audio 已经退出，
         # 再往里送音频只会开新一轮、音频包全堆在队列里没人消费，表现就是"能说话但没声音"
-        if chat_bot is None or self.is_playing or self.is_session_closed:
+        if chat_bot is None or self.is_playing or self.is_session_closed or self._conversation_busy():
             return
 
         chat_bot.audio_callback(indata, frames, time, status)
@@ -1016,6 +1118,12 @@ class AIClient:
     # ---------------- 入口 ----------------
 
     async def run(self):
+        # 上一次断电/强杀留下的执行不能冒充成功，也不自动重做有副作用的任务。
+        try:
+            await asyncio.to_thread(schedules.recover_interrupted, SESSION_DB_PATH)
+        except (OSError, SQLAlchemyError):
+            logger.exception("恢复定时任务状态失败")
+            self.schedule_state = {**self.schedule_state, "error": "恢复定时任务状态失败，详见服务日志"}
         await set_default_volume()
         self._output_stream = sd.OutputStream(samplerate=OUTPUT_SAMPLE_RATE, channels=1, dtype=np.int16)
         self._output_stream.start()

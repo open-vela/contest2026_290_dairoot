@@ -299,7 +299,29 @@
       "collection_mode": "cli",
       "health": "ok",
       "model": "claude-opus-5-5"
+    },
+    {
+      "session_id": "01a191b8-c57b-7131-834b-8e05afce9c27",
+      "tool": "codex",
+      "started_at": "2026-10-31T11:29:28.731Z",
+      "last_event_at": "2026-10-31T15:06:34.328Z",
+      "event_count": 301,
+      "raw_event_count": 868,
+      "file_path": "logs/dairoot/2026-10-31/codex__01a191b8-c57b-7131-834b-8e05afce9c27.jsonl",
+      "collection_mode": "cli",
+      "source_interface": "codex-desktop",
+      "health": "ok",
+      "model": "gpt-6.1-sol",
+      "redacted_count_total": 5,
+      "format_adapter": "codex-response-item-to-contest-v1",
+      "collector_revision": "open-vela/.claude@ac36068f8571b2cced14c5f23f6cebb47026d1c6",
+      "source_file": "rollout-2026-10-31T19-29-28-01a191b8-c57b-7131-834b-8e05afce9c27.jsonl",
+      "source_snapshot_sha256": "7cc16e218f31c908568ef1d4817501aa83eb2c31e41e350ebc016eee29f3ef46",
+      "snapshot_through_line": 868,
+      "omitted_binary_payloads": 6,
+      "export_scope": "Real user/assistant dialogue, tool calls/results and recorded token usage through the user submission request. Excludes injected configuration, internal reasoning, runtime control events and image bytes; attachment references remain in the source text. Text is preserved without truncation and written with official snapshot_core@1.3.0 redaction and JSONL serialization.",
+      "tokens_total": 22753489
     }
   ],
-  "updated_at": "2026-10-25T08:49:23.016419+00:00"
+  "updated_at": "2026-10-31T15:10:40.082Z"
 }

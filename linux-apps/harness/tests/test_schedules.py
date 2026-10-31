@@ -278,6 +278,28 @@ class CollectTest(TempDatabase, unittest.TestCase):
         self.create({"prompt": "b", "repeat": "hourly", "time": "00:20"})
         self.assertEqual(self.collect("2026-10-26T08:00:00")[1], local("2026-10-26T08:20:00"))
 
+    def test_interrupted_runs_become_errors_and_are_not_repeated(self):
+        for state in ("queued", "running"):
+            task = self.create({"prompt": state, "repeat": "daily", "time": "09:00"})
+            run = [(task["id"], local("2026-10-26T09:00:00"))]
+            schedules.mark_runs(self.path, run, status=state)
+        schedules.recover_interrupted(self.path)
+        tasks = schedules.list_tasks(self.path, now=local("2026-10-26T09:01:00"), tz=TZ8)
+        self.assertTrue(all(task["last_status"] == "error" and "中断" in task["last_error"] for task in tasks))
+        self.assertEqual(self.collect("2026-10-26T09:01:00")[0], [])
+
+    def test_old_result_cannot_overwrite_a_new_run(self):
+        task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
+        first = [(task["id"], local("2026-10-26T09:00:00"))]
+        second = [(task["id"], local("2026-10-27T09:00:00"))]
+        schedules.mark_runs(self.path, first, status="running")
+        schedules.mark_runs(self.path, second, status="queued")
+        schedules.mark_runs(self.path, first, status="done", finishing=True)
+        self.assertEqual(self.get(task["id"])["last_status"], "queued")
+        schedules.mark_runs(self.path, second, status="cancelled", finishing=True)
+        schedules.mark_runs(self.path, second, status="done", finishing=True)
+        self.assertEqual(self.get(task["id"])["last_status"], "cancelled")
+
 
 class FakeBot:
     """只记下 send_text 收到的消息。"""
@@ -286,8 +308,11 @@ class FakeBot:
         self.sent = []
         self.llm = SimpleNamespace(messages=[], round=0)
 
-    async def send_text(self, text, role="user", response_instructions=None, **kwargs):
+    async def execute_text(self, text, role="user", response_instructions=None, **kwargs):
         self.sent.append((text, response_instructions))
+
+    def arm_idle_timer(self):
+        pass
 
 
 class MainScheduleTest(TempDatabase, unittest.IsolatedAsyncioTestCase):
@@ -301,7 +326,7 @@ class MainScheduleTest(TempDatabase, unittest.IsolatedAsyncioTestCase):
         self.client = main.AIClient(config)
         self.bot = FakeBot()
 
-    async def fake_restart(self):
+    async def fake_restart(self, **kwargs):
         self.client.chat_bot, self.client.is_session_closed = self.bot, False
 
     @staticmethod
@@ -309,7 +334,8 @@ class MainScheduleTest(TempDatabase, unittest.IsolatedAsyncioTestCase):
         return datetime.datetime.now(datetime.timezone.utc)
 
     async def settle(self):
-        await asyncio.gather(*list(self.client._text_tasks))
+        if self.client.conversation.worker:
+            await self.client.conversation.worker
 
     async def wait_until(self, condition):
         for _ in range(300):
@@ -338,45 +364,155 @@ class MainScheduleTest(TempDatabase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.sent, [(schedules.trigger_text([first, second]), schedules.TRIGGER_INSTRUCTIONS)])
         self.assertEqual(query(self.path, "SELECT last_run_at, last_status, last_error FROM scheduled_tasks"),
                          [("2026-10-26T01:00:00+00:00", "done", None)] * 2)
-        self.assertEqual(self.client.schedule_state["revision"], 1)
+        self.assertEqual(self.client.schedule_state["revision"], 3)
 
     async def test_open_session_waits_for_the_current_reply(self):
         task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
-        self.client.chat_bot, self.client.is_playing = self.bot, True
+        self.client.chat_bot = self.bot
         events = []
+        reply_done = asyncio.Event()
 
-        async def finish_reply():
-            await asyncio.sleep(0.05)
-            events.append("回复说完")
-            self.client.is_playing = False
+        async def send_text(text, **kwargs):
+            if text == "先回复":
+                await reply_done.wait()
+                events.append("回复说完")
+            else:
+                events.append("定时任务")
 
-        async def send_text(*args, **kwargs):
-            events.append("定时任务")
-
-        self.bot.send_text = send_text
+        self.bot.execute_text = send_text
         with patch.object(self.client, "restart", AsyncMock()) as restart:
-            await asyncio.gather(finish_reply(), self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))]))
+            await self.client.send_text("先回复")
+            await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
+            self.assertEqual(events, [])
+            self.assertEqual(self.get(task["id"])["last_status"], "queued")
+            reply_done.set()
             await self.settle()
         restart.assert_not_awaited()  # 会话开着就接在当前会话里
         self.assertEqual(events, ["回复说完", "定时任务"])
 
-    async def test_busy_session_is_interrupted_after_the_wait(self):
+    async def test_queued_schedule_does_not_run_twice(self):
         task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
-        self.client.chat_bot, self.client.is_playing = self.bot, True  # 一直在说（例如放歌）
-        with patch.object(main, "SCHEDULE_IDLE_WAIT", 0):
+        self.client.chat_bot = self.bot
+        self.client.conversation.paused = True
+        run = [(task, local("2026-10-26T09:00:00"))]
+        await self.client._run_scheduled(run)
+        await self.client._run_scheduled(run)
+        await self.client.run_schedule_now(task["id"])
+        self.assertEqual(len(self.client.conversation.pending), 1)
+        await self.client.resume_messages()
+        await self.settle()
+        self.assertEqual(len(self.bot.sent), 1)
+
+    async def test_running_is_not_done_until_the_reply_finishes(self):
+        task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
+        self.client.chat_bot = self.bot
+        started, finished = asyncio.Event(), asyncio.Event()
+
+        async def reply(*args, **kwargs):
+            started.set()
+            await finished.wait()
+
+        self.bot.execute_text = reply
+        await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
+        await asyncio.wait_for(started.wait(), 2)
+        self.assertEqual(self.get(task["id"])["last_status"], "running")
+        self.assertEqual(self.get(task["id"])["status_text"], "执行中")
+        self.assertEqual(self.collect("2026-10-26T09:01:00")[0], [])
+        finished.set()
+        await self.settle()
+        self.assertEqual(self.get(task["id"])["last_status"], "done")
+
+    async def test_async_execution_failure_is_persisted_and_next_message_runs(self):
+        first = self.create({"prompt": "天气", "repeat": "daily", "time": "09:00"})
+        second = self.create({"prompt": "喝水", "repeat": "daily", "time": "10:00"})
+        self.client.chat_bot = self.bot
+        self.bot.execute_text = AsyncMock(side_effect=[RuntimeError("TTS 断线"), None])
+        with self.assertLogs("web_console", level="ERROR"):
+            await self.client._run_scheduled([(first, local("2026-10-26T09:00:00"))])
+            await self.client._run_scheduled([(second, local("2026-10-26T10:00:00"))])
+            await self.settle()
+        self.assertEqual((self.get(first["id"])["last_status"], self.get(first["id"])["last_error"]),
+                         ("error", "TTS 断线"))
+        self.assertEqual(self.get(second["id"])["last_status"], "done")
+
+    async def test_stop_and_clear_persist_cancelled_states(self):
+        first = self.create({"prompt": "天气", "repeat": "daily", "time": "09:00"})
+        second = self.create({"prompt": "喝水", "repeat": "daily", "time": "10:00"})
+        self.client.chat_bot = self.bot
+        self.bot.abort = AsyncMock()
+        started = asyncio.Event()
+
+        async def reply(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        self.bot.execute_text = reply
+        await self.client._run_scheduled([(first, local("2026-10-26T09:00:00"))])
+        await self.client._run_scheduled([(second, local("2026-10-26T10:00:00"))])
+        await asyncio.wait_for(started.wait(), 2)
+        with patch.object(self.client, "play_audio", new=AsyncMock()):
+            await self.client.stop_reply()
+        self.assertEqual(self.get(first["id"])["last_status"], "cancelled")
+        self.assertEqual(self.get(second["id"])["last_status"], "queued")
+        await self.client.clear_messages()
+        self.assertEqual(self.get(second["id"])["last_status"], "cancelled")
+
+    async def test_reset_cancels_active_and_pending_schedules(self):
+        task = self.create({"prompt": "天气", "repeat": "daily", "time": "09:00"})
+        self.client.conversation.paused = True
+        await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
+        await self.client._stop_bot()
+        self.assertEqual(self.get(task["id"])["last_status"], "cancelled")
+        self.assertEqual(self.client.conversation.pending, [])
+
+    async def test_failed_result_write_is_retried_without_executing_again(self):
+        task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
+        self.client.chat_bot = self.bot
+        original = schedules.mark_runs
+
+        def mark(*args, status, **kwargs):
+            if status == "done":
+                raise OSError("磁盘暂时不可写")
+            return original(*args, status=status, **kwargs)
+
+        with patch.object(schedules, "mark_runs", side_effect=mark), self.assertLogs("web_console", level="ERROR"):
             await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
             await self.settle()
+        self.assertEqual(self.get(task["id"])["last_status"], "running")
+        self.assertIn("保存失败", self.client.schedule_state["error"])
+        await self.client._retry_schedule_results()
+        self.assertEqual(self.get(task["id"])["last_status"], "done")
         self.assertEqual(len(self.bot.sent), 1)
+
+    async def test_playback_error_terminates_the_schedule_as_failed(self):
+        task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
+        self.client.chat_bot = self.bot
+        async def reply(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        async def failed_playback():
+            raise RuntimeError("扬声器断开")
+
+        self.bot.execute_text = reply
+        self.client._play_task = asyncio.create_task(failed_playback())
+        with patch.object(self.client, "_reset_playback", new=AsyncMock()) as reset, \
+                self.assertLogs("web_console", level="ERROR"):
+            await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
+            await self.settle()
+        reset.assert_awaited_once_with(self.bot)
+        self.assertEqual((self.get(task["id"])["last_status"], self.get(task["id"])["last_error"]),
+                         ("error", "扬声器断开"))
 
     async def test_failed_start_is_recorded_on_the_task(self):
         task = self.create({"prompt": "喝水", "repeat": "daily", "time": "09:00"})
 
-        async def failed_restart():
+        async def failed_restart(**kwargs):
             self.client.last_error = "TTS（豆包 v1）尚未配置：请在 .env 中填写 BYTEDANCE_TTS_APP_ID"
 
         with patch.object(self.client, "restart", AsyncMock(side_effect=failed_restart)), \
                 self.assertLogs("web_console", level="ERROR"):
             await self.client._run_scheduled([(task, local("2026-10-26T09:00:00"))])
+            await self.settle()
         saved = self.get(task["id"])
         self.assertEqual((saved["last_status"], saved["last_error"]), ("error", self.client.last_error))
         self.assertEqual(self.bot.sent, [])
@@ -443,6 +579,7 @@ class ScheduleHttpTest(TempDatabase, unittest.TestCase):
         config = copy.deepcopy(main.DEFAULT_CONFIG)
         config["timezone"] = 8
         self.client = main.AIClient(config)
+        self.client.conversation.paused = True
         self.web = TestClient(create_app(self.client))
         self.web.__enter__()
         self.addCleanup(self.web.__exit__, None, None, None)
@@ -471,7 +608,8 @@ class ScheduleHttpTest(TempDatabase, unittest.TestCase):
         self.assertEqual((response.status_code, response.json()["task"]["status_text"]), (200, "已暂停"))
         response = self.web.post(f"/api/schedules/{task['id']}/run")
         self.assertEqual((response.status_code, response.json()["task"]["id"]), (200, task["id"]))
-        self.assertEqual(self.client._manual_runs, [task["id"]])
+        self.assertEqual(len(self.client.conversation.pending), 1)
+        self.assertEqual(response.json()["task"]["last_status"], "queued")
 
         self.assertEqual(self.web.delete(f"/api/schedules/{task['id']}").json(), {"ok": True})
         for method, url in (("PATCH", f"/api/schedules/{task['id']}"), ("DELETE", f"/api/schedules/{task['id']}"),

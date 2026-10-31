@@ -17,7 +17,7 @@ with patch("dotenv.load_dotenv"):
     import main
 
 from server import create_app
-from session_store import _read_database, save_session
+from session_store import TOOL_METADATA_FIELDS, _read_database, save_session
 
 
 STARTED_AT = datetime.datetime(2026, 10, 18, 3, 4, 5, tzinfo=datetime.timezone.utc)
@@ -183,6 +183,70 @@ class SessionQueryTest(unittest.TestCase):
         self.assertEqual(messages[1]["usage"], {})
         self.assertIsNone(messages[2]["role"])
         self.assertIsNone(messages[2]["content"])
+
+    def test_detail_preserves_parallel_tool_calls_and_their_result_ids(self):
+        calls = [
+            {"id": "call_first", "type": "function", "function": {
+                "name": "speaker_volume", "arguments": '{ "action": "set", "percent": 35 }',
+            }},
+            {"id": "call_second", "type": "function", "function": {
+                "name": "speaker_volume", "arguments": '{"action":"get"}',
+            }},
+        ]
+        self.save("tools", [
+            {"role": "user", "content": "调整音量再查询"},
+            {"role": "assistant", "content": None, "tool_calls": calls},
+            {"role": "tool", "tool_call_id": "call_second", "name": "speaker_volume",
+             "content": '{"percent":35}', "elapsed_time": "0.000s"},
+            {"role": "tool", "tool_call_id": "call_first", "name": "speaker_volume",
+             "content": "音量已设为 35%", "elapsed_time": "0.125s"},
+        ])
+        response = self.web.get("/api/sessions/tools")
+        self.assertEqual(response.status_code, 200)
+        messages = response.json()["session"]["messages"]
+        self.assertEqual(messages[1]["tool_calls"], calls)  # 参数字符串及空白原样保留。
+        self.assertEqual([message["tool_call_id"] for message in messages[2:]], ["call_second", "call_first"])
+        self.assertEqual([message["name"] for message in messages[2:]], ["speaker_volume", "speaker_volume"])
+        self.assertEqual([message["elapsed_time"] for message in messages[2:]], ["0.000s", "0.125s"])
+        self.assertTrue(all(messages[0][field] is None for field in TOOL_METADATA_FIELDS))
+        self.assertIsNone(self.client.chat_bot)
+        self.assertEqual(list(self.path.parent.glob("*.jsonl")), [])
+
+    def test_metadata_is_scoped_to_session_and_not_extracted_from_body(self):
+        for session_id in ("first", "second"):
+            self.save(session_id, [
+                {"role": "assistant", "tool_calls": [{"id": "same-id", "type": "function", "function": {
+                    "name": session_id, "arguments": '{"text":"<script> & 中文"}',
+                }}]},
+                {"role": "tool", "tool_call_id": "same-id", "name": session_id, "content": None},
+                {"role": "tool", "content": '{"name":"正文里的名字","elapsed_time":"1s"}'},
+            ])
+        for session_id in ("first", "second"):
+            messages = self.web.get("/api/sessions/" + session_id).json()["session"]["messages"]
+            self.assertEqual(messages[0]["tool_calls"][0]["function"]["name"], session_id)
+            self.assertEqual(messages[1]["name"], session_id)
+            self.assertTrue(all(messages[2][field] is None for field in TOOL_METADATA_FIELDS))
+
+    def test_empty_and_malformed_arguments_are_retained(self):
+        calls = [
+            {"id": "empty", "type": "function", "function": {"name": "test", "arguments": ""}},
+            {"id": "invalid", "type": "function", "function": {"name": "test", "arguments": '{"x":'}},
+        ]
+        self.save("arguments", [{"role": "assistant", "tool_calls": calls},
+                                 {"role": "assistant", "tool_calls": []}])
+        messages = self.web.get("/api/sessions/arguments").json()["session"]["messages"]
+        self.assertEqual(messages[0]["tool_calls"], calls)
+        self.assertEqual(messages[1]["tool_calls"], [])
+
+    def test_tool_metadata_uses_message_columns_without_an_extra_table(self):
+        self.seed()
+        with closing(sqlite3.connect(self.path)) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+            self.assertTrue(set(TOOL_METADATA_FIELDS) <= columns)
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(tables, {"sessions", "messages", "scheduled_tasks", "diaries", "memory", "diary_sessions", "voiceprints"})
+        messages = self.web.get("/api/sessions/newer-b").json()["session"]["messages"]
+        self.assertTrue(all(message[field] is None for message in messages for field in TOOL_METADATA_FIELDS))
 
     def test_detail_returns_speaker_and_message_send_time_with_original_timezone(self):
         sent_at = "2026-10-18T13:09:44.584297+08:00"

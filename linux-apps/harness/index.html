@@ -177,6 +177,13 @@ button:disabled { opacity:.5; cursor:default; }
 .banner.warn { color:var(--warn); border-color:var(--warn); }
 .banner.err { color:var(--err); border-color:var(--err); }
 #msg-count { color:var(--muted); font-weight:400; }
+#message-queue { flex:none; margin:8px 0; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font-size:12px; }
+.queue-head { display:flex; align-items:center; gap:8px; }
+#queue-title { flex:1; }
+#queue-items { max-height:120px; overflow:auto; padding-left:22px; margin:6px 0 0; }
+#queue-items li { white-space:pre-wrap; overflow-wrap:anywhere; }
+#conversation-error { font-size:12px; color:var(--err); }
+#stop { color:var(--err); }
 #voiceprint-open { margin-left:auto; }
 #voiceprint-open, #diary-open, #history-open, #restart { padding:4px 10px; font-size:12px; }
 #diary-open, #history-open {
@@ -422,8 +429,17 @@ details.thinking pre { color:var(--muted); }
     <h2>聊天信息 <span id="msg-count"></span><button id="voiceprint-open" type="button">声纹</button><a id="diary-open" href="/diary">日记</a><a id="history-open" href="/history">历史会话</a><button id="restart">重新开始</button></h2>
     <div id="banner" class="banner" hidden></div>
     <div id="messages"></div>
+    <div id="conversation-error" role="alert"></div>
+    <section id="message-queue" hidden aria-label="待发消息">
+      <div class="queue-head"><span id="queue-title" role="status"></span>
+        <button id="queue-resume" type="button" class="link" hidden>继续</button>
+        <button id="queue-clear" type="button" class="link">清空</button>
+      </div>
+      <ol id="queue-items"></ol>
+    </section>
     <div class="composer">
       <textarea id="send-text" rows="2" placeholder="打字发给它（等同说话，Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="stop" type="button" title="停止当前回复并暂停队列，待发消息保留" disabled>停止</button>
       <button id="send" class="primary">发送</button>
     </div>
     <div id="send-note"></div>
@@ -1115,10 +1131,13 @@ async function post(url, body, okText) {
 
 function renderStatus(s) {
   renderSkillInstall(s.skill_install);
+  renderConversation(s.conversation || {});
   const badges = [];
   if (s.restarting) badges.push(["重启中", "warn"]);
   else if (!s.running) badges.push(["未启动", "err"]);
   else if (s.session_closed) badges.push(["会话已结束", "warn"]);
+  else if (s.conversation?.paused) badges.push(["队列已暂停", "warn"]);
+  else if (s.conversation?.active) badges.push(["处理中", "busy"]);
   else if (s.speaking) badges.push(["说话中", "busy"]);
   else badges.push(["聆听中", "ok"]);
   badges.push(["第 " + s.round + " 轮", ""]);
@@ -1139,6 +1158,20 @@ function renderStatus(s) {
   } else {
     banner.hidden = true;
   }
+}
+
+function renderConversation(state) {
+  const pending = state.pending || [];
+  $("#stop").disabled = !state.active || state.stopping;
+  $("#stop").textContent = state.stopping ? "停止中…" : "停止";
+  $("#message-queue").hidden = !pending.length && !state.paused;
+  $("#queue-title").textContent = (state.paused ? "队列已暂停 · " : "") + pending.length + " 条待发";
+  $("#queue-resume").hidden = !state.paused;
+  $("#queue-resume").disabled = Boolean(state.stopping);
+  $("#queue-clear").disabled = !pending.length || state.stopping;
+  $("#queue-items").replaceChildren(...pending.map((item) => el("li", null,
+    (item.source === "schedule" ? "定时任务：" : item.source === "voice" ? "语音：" : "") + item.text)));
+  $("#conversation-error").textContent = state.error || "";
 }
 
 function formatUsage(u) {  // assistant 消息上的 token 用量：↑prompt(缓存命中) ↓completion · 首包耗时
@@ -1449,9 +1482,11 @@ function renderScheduleRow(task, open) {
   name.title = task.prompt;
   // 摘要行：还会执行的显示排期（上次失败的标出来），执行完、暂停、错过的显示状态
   const upcoming = task.enabled && task.next_run;
+  const active = ["queued", "running"].includes(task.last_status);
   const missed = !upcoming && task.enabled && ["已错过", "执行失败"].includes(task.status_text);
-  const state = el("span", "mcp-state" + (missed ? " err" : ""), upcoming ? task.summary : task.status_text);
+  const state = el("span", "mcp-state" + (missed ? " err" : ""), active ? task.status_text : upcoming ? task.summary : task.status_text);
   if (upcoming && task.last_status === "error") state.append(el("span", "schedule-failed", " · 上次失败"));
+  if (upcoming && task.last_status === "cancelled") state.append(el("span", null, " · 上次取消"));
   state.title = task.status_text;
   const summary = el("div", "mcp-summary");
   summary.append(enabled, el("span", "mcp-arrow", "▶"), name, state);
@@ -1462,7 +1497,7 @@ function renderScheduleRow(task, open) {
   const meta = el("div", "schedule-meta");
   meta.append(el("div", null, task.summary + " · " + task.status_text));
   if (task.last_run_text) {
-    const result = { done: "已执行", missed: "已错过", error: "执行失败" }[task.last_status] || "";
+    const result = { queued: "排队中", running: "执行中", done: "已完成", missed: "已错过", error: "执行失败", cancelled: "已取消" }[task.last_status] || "";
     meta.append(el("div", null, "上次 " + task.last_run_text + (result ? " · " + result : "")));
   }
   if (task.last_status === "error" && task.last_error) meta.append(el("div", "err", task.last_error));
@@ -1474,6 +1509,7 @@ function renderScheduleRow(task, open) {
   ]) {
     const button = el("button", cls, text);
     button.type = "button";
+    if (text === "立即运行") button.disabled = active;
     button.addEventListener("click", handler);
     ops.append(button);
   }
@@ -1793,6 +1829,21 @@ async function sendText() {
 }
 
 $("#send").addEventListener("click", sendText);
+async function controlConversation(url, method = "POST") {
+  try {
+    const response = await fetch(url, {method});
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "操作失败");
+    fullState.conversation = data.conversation;
+    renderConversation(data.conversation);
+  } catch (error) {
+    $("#send-note").textContent = error.message || String(error);
+    $("#send-note").className = "err";
+  }
+}
+$("#stop").addEventListener("click", () => controlConversation("/api/stop"));
+$("#queue-resume").addEventListener("click", () => controlConversation("/api/queue/resume"));
+$("#queue-clear").addEventListener("click", () => controlConversation("/api/queue", "DELETE"));
 $("#send-text").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {  // 中文输入法选词的回车不算发送
     event.preventDefault();

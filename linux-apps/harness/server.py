@@ -7,6 +7,9 @@
 - POST /api/config   保存配置并按新配置重建 ChatBot
 - POST /api/restart  用当前配置重开一轮会话
 - POST /api/send     发一句文本给 ChatBot（等同说话，照样会出声）
+- POST /api/stop     停止当前生成/播放，暂停待发队列
+- POST /api/queue/resume  继续发送队列
+- DELETE /api/queue  清空尚未执行的消息
 - POST /api/voiceprints  从当前语音消息录入姓名与声纹，保存到 harness 数据库
 - DELETE /api/voiceprints  按姓名删除声纹
 - POST /api/mcp/install  给缺 Python 包连不上的 MCP server 装包，装完自动重启重连
@@ -83,10 +86,26 @@ def create_app(client) -> Starlette:
 
     async def post_send(request: Request):
         try:
-            await client.send_text((await request.json()).get("text", ""))
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("请求需要 JSON 对象")
+            message = await client.send_text(body.get("text", ""))
         except ValueError as e:
             return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "message": message})
+
+    async def post_stop(request: Request):
+        return JSONResponse({"ok": True, "conversation": await client.stop_reply()})
+
+    async def post_resume(request: Request):
+        try:
+            state = await client.resume_messages()
+        except ValueError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, "conversation": state})
+
+    async def delete_queue(request: Request):
+        return JSONResponse({"ok": True, "conversation": await client.clear_messages()})
 
     async def post_mcp_install(request: Request):
         try:
@@ -310,6 +329,9 @@ def create_app(client) -> Starlette:
             Route("/api/config", post_config, methods=["POST"]),
             Route("/api/restart", post_restart, methods=["POST"]),
             Route("/api/send", post_send, methods=["POST"]),
+            Route("/api/stop", post_stop, methods=["POST"]),
+            Route("/api/queue/resume", post_resume, methods=["POST"]),
+            Route("/api/queue", delete_queue, methods=["DELETE"]),
             Route("/api/voiceprints", update_voiceprints, methods=["POST", "DELETE"]),
             Route("/api/mcp/install", post_mcp_install, methods=["POST"]),
             Route("/api/skills/install", post_skill_install, methods=["POST"]),

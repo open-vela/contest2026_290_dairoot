@@ -8,6 +8,8 @@ from pathlib import Path
 from sqlalchemy import ForeignKey, JSON, Text, URL, create_engine, event, func, or_, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
+TOOL_METADATA_FIELDS = ("tool_calls", "tool_call_id", "name", "elapsed_time")
+
 
 class Base(DeclarativeBase):
     pass
@@ -38,6 +40,10 @@ class ChatMessage(Base):
     time: Mapped[str | None] = mapped_column(Text)
     content: Mapped[str | None] = mapped_column(Text)
     usage: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    tool_calls: Mapped[list | None] = mapped_column(JSON(none_as_null=True))
+    tool_call_id: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(Text)
+    elapsed_time: Mapped[str | None] = mapped_column(Text)
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 
 
@@ -181,7 +187,8 @@ def get_session(path: str, session_id: str) -> dict | None:
             "id": record.id, "started_at": record.started_at, "ended_at": record.ended_at,
             "messages": [
                 {"position": message.position, "role": message.role, "speaker": message.speaker, "time": message.time,
-                 "content": message.content, "usage": message.usage}
+                 "content": message.content, "usage": message.usage,
+                 **{field: getattr(message, field) for field in TOOL_METADATA_FIELDS}}
                 for message in record.messages
             ],
         }
@@ -209,6 +216,7 @@ def save_session(
                 **_message_metadata(message),
                 content=_serialize_content(message.get("content"), role=message.get("role")),
                 usage=message.get("usage"),
+                **{field: message.get(field) for field in TOOL_METADATA_FIELDS},
             )
             for position, message in enumerate(messages)
         ],
