@@ -321,7 +321,29 @@
       "omitted_binary_payloads": 6,
       "export_scope": "Real user/assistant dialogue, tool calls/results and recorded token usage through the user submission request. Excludes injected configuration, internal reasoning, runtime control events and image bytes; attachment references remain in the source text. Text is preserved without truncation and written with official snapshot_core@1.3.0 redaction and JSONL serialization.",
       "tokens_total": 22753489
+    },
+    {
+      "session_id": "01a19294-6146-7551-8357-b0ff672a178b",
+      "tool": "codex",
+      "started_at": "2026-10-31T15:37:24.214Z",
+      "last_event_at": "2026-10-31T17:41:44.168Z",
+      "event_count": 567,
+      "raw_event_count": 1712,
+      "file_path": "logs/dairoot/2026-10-31/codex__01a19294-6146-7551-8357-b0ff672a178b.jsonl",
+      "collection_mode": "cli",
+      "source_interface": "codex-desktop",
+      "health": "ok",
+      "model": "gpt-6.1-sol",
+      "redacted_count_total": 0,
+      "format_adapter": "codex-response-item-to-contest-v1",
+      "collector_revision": "open-vela/.claude@ac36068f8571b2cced14c5f23f6cebb47026d1c6",
+      "source_file": "rollout-2026-10-31T23-37-24-01a19294-6146-7551-8357-b0ff672a178b_01a1929b-c3f6-75b1-9db3-b5462206a4da.jsonl",
+      "source_snapshot_sha256": "f18504a4df9ca84c8c8c67729ccb8923fc6da0be7b0a0843254cca3ec56ba6f7",
+      "snapshot_through_line": 1712,
+      "omitted_binary_payloads": 1,
+      "export_scope": "Real user/assistant dialogue, tool calls/results and recorded token usage through the user submission request. Excludes injected configuration, internal reasoning, runtime control events and image bytes; attachment references remain in the source text. Text is preserved without truncation and written with official snapshot_core@1.3.0 redaction and JSONL serialization.",
+      "tokens_total": 38479778
     }
   ],
-  "updated_at": "2026-10-31T15:10:40.082Z"
+  "updated_at": "2026-10-31T17:51:16.263Z"
 }
