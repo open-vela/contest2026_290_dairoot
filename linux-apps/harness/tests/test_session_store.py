@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 with patch("dotenv.load_dotenv"):
     import main
 
-from session_store import ChatSession, save_session
+from session_store import ChatSession, _write_database, get_session, save_session
 
 
 STARTED_AT = datetime.datetime(2026, 10, 18, 3, 4, 5, tzinfo=datetime.timezone.utc)
@@ -323,6 +323,48 @@ class SessionStoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([content for content, usage in rows], ["你好", "你好", "空用量", "零用量"])
         self.assertEqual([json.loads(usage) if usage is not None else None for content, usage in rows],
                          [None, None, {}, {"total_tokens": 0}])
+
+    async def test_tool_metadata_is_saved_with_calls_and_results_without_changing_content(self):
+        self.bot.llm.messages[3]["elapsed_time"] = "0.042s"
+        original = copy.deepcopy(self.bot.llm.messages)
+        session_id = self.client.save_messages()
+        rows = self.query(
+            "SELECT position, tool_calls, tool_call_id, name, elapsed_time "
+            "FROM messages WHERE session_id = ? ORDER BY position", (session_id,),
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0], (0, None, None, None, None))
+        self.assertEqual(rows[1][0], 1)  # system 过滤后的位置。
+        self.assertEqual(json.loads(rows[1][1]), original[2]["tool_calls"])
+        self.assertEqual(rows[1][2:], (None, None, None))
+        self.assertEqual(rows[2], (2, None, "call_1", "speaker_volume", "0.042s"))
+        self.assertEqual(rows[3], (3, None, None, None, None))
+        self.assertEqual(self.stored_messages(session_id), self.saved_messages)
+        self.assertEqual(self.bot.llm.messages, original)
+
+    async def test_tool_metadata_does_not_depend_on_debug_logging(self):
+        self.bot.llm.messages[3]["elapsed_time"] = "0.000s"
+        with patch.object(main, "DEBUG", False):
+            session_id = self.client.save_messages()
+        record = get_session(str(self.path), session_id)
+        self.assertEqual(record["messages"][1]["tool_calls"], self.messages[2]["tool_calls"])
+        self.assertEqual(record["messages"][2]["elapsed_time"], "0.000s")
+        self.assertEqual(list(self.path.parent.glob("*.jsonl")), [])
+
+    async def test_deleting_a_session_also_deletes_its_messages_with_tool_fields(self):
+        session_id = self.client.save_messages()
+        with _write_database(str(self.path)) as session:
+            session.delete(session.get(ChatSession, session_id))
+        self.assertEqual(self.query("SELECT count(*) FROM messages"), [(0,)])
+
+    async def test_metadata_write_failure_rolls_back_the_entire_session(self):
+        from sqlalchemy.exc import StatementError
+
+        messages = [{"role": "tool", "content": "结果", "elapsed_time": {"invalid": "not a string"}}]
+        with self.assertRaises(StatementError):
+            save_session(str(self.path), "failed", STARTED_AT, STARTED_AT, messages)
+        self.assertEqual(self.query("SELECT count(*) FROM sessions"), [(0,)])
+        self.assertEqual(self.query("SELECT count(*) FROM messages"), [(0,)])
 
     async def test_directory_failure_does_not_interrupt_close_and_retries_on_stop(self):
         self.path.parent.write_text("blocks mkdir", encoding="utf-8")

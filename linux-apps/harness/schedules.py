@@ -21,6 +21,7 @@ MAX_TASKS = 50
 PROMPT_LIMIT = 500
 TITLE_LIMIT = 40
 MAX_IN_MINUTES = 7 * 24 * 60
+ACTIVE_STATUSES = {"queued", "running"}
 # 到点时 harness 没在跑（关机、重启中）：这么久以内的照常补执行，更早的记为错过。
 MISS_GRACE = datetime.timedelta(minutes=15)
 CLOCK = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
@@ -54,7 +55,7 @@ class ScheduledTask(Base):
     created_at: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[str] = mapped_column(Text)
     last_run_at: Mapped[str | None] = mapped_column(Text)  # 上次执行或错过的计划时间；手动运行记运行时刻
-    last_status: Mapped[str | None] = mapped_column(Text)  # done / missed / error
+    last_status: Mapped[str | None] = mapped_column(Text)  # queued / running / done / missed / error / cancelled
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -290,8 +291,10 @@ def present(task: dict, *, now: datetime.datetime, tz: datetime.tzinfo) -> dict:
             elif due is not None:
                 status = "已错过"  # 超过宽限还没执行，调度循环下一轮会记下来
     if not status:
-        status = "已暂停" if not task["enabled"] else {"missed": "已错过", "error": "执行失败"}.get(
+        status = "已暂停" if not task["enabled"] else {"missed": "已错过", "error": "执行失败", "cancelled": "已取消"}.get(
             task["last_status"], "已完成")
+    if task["last_status"] in ACTIVE_STATUSES:
+        status = {"queued": "排队中", "running": "执行中"}[task["last_status"]]
     last_run = datetime.datetime.fromisoformat(task["last_run_at"]) if task["last_run_at"] else None
     return {
         **task,
@@ -357,15 +360,28 @@ def delete_task(path: str, task_id: int) -> None:
         session.delete(record)
 
 
-def mark_runs(path: str, runs: list[tuple[int, datetime.datetime]], *, status: str, error: str = "") -> None:
-    """记下执行（或错过）的计划时间和结果；期间被删掉的任务跳过。"""
+def mark_runs(path: str, runs: list[tuple[int, datetime.datetime]], *, status: str, error: str = "",
+              finishing: bool = False) -> None:
+    """记录状态；后续更新只匹配同一次仍未结束的执行，防止迟到结果覆盖新执行。"""
     with _write_database(path) as session:
         for task_id, moment in runs:
             record = session.get(ScheduledTask, task_id)
             if record is not None:
+                if finishing and (record.last_run_at != _utc(moment) or record.last_status not in ACTIVE_STATUSES):
+                    continue
                 record.last_run_at = _utc(moment)
                 record.last_status = status
                 record.last_error = error or None
+
+
+def recover_interrupted(path: str) -> None:
+    """启动时标记上次未完成的执行；不重放可能已经产生副作用的操作。"""
+    if not Path(path).exists():
+        return
+    with _write_database(path) as session:
+        for record in session.scalars(select(ScheduledTask).where(ScheduledTask.last_status.in_(ACTIVE_STATUSES))):
+            record.last_status = "error"
+            record.last_error = "上次执行因服务退出而中断，请确认结果后手动运行"
 
 
 def collect_due(
@@ -384,6 +400,8 @@ def collect_due(
         tasks = [_task_dict(record) for record in records]
     due, missed, wake = [], [], None
     for task in tasks:
+        if task["last_status"] in ACTIVE_STATUSES:
+            continue
         run = _latest_due(task, now, tz)
         if run is not None:
             (due if now - run <= MISS_GRACE else missed).append((task, run))

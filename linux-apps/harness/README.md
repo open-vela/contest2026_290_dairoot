@@ -85,6 +85,33 @@ MiMo 需在 `.env` 配置 `MIMO_API_KEY`，可选 `MIMO_TTS_VOICE`（默认 `mim
 配置中的脚本路径相对于 harness 目录；MCP 服务列表以保存的配置为准。SDK 自带的 aichat-tools 和
 内置的「定时任务」不写在配置里，由 harness 启动时自动加载，配置台显示为只读的「默认」行。
 
+## 消息排队与停止
+
+手打消息、语音识别结果和到点的定时任务共用一个队列，按进入顺序执行。
+上一条的模型调用、工具调用和音频播放全部结束后，才发送下一条；待发消息在聊天区下方显示，
+开始执行后才进入聊天记录。最多保留 50 条待发消息，超出时明确报错。
+
+点击输入框旁的「停止」会中止当前生成和播放，并暂停队列；当前会话和待发消息保留。
+点击「继续」按原顺序发送；「清空」只取消尚未执行的消息。
+队列暂停期间停止拾音，手打消息仍可加入队列，点击「继续」后执行。
+停止不会撤销已经完成的设备操作，也不能保证终止外部 MCP 服务已经开始的操作。
+点击「重新开始」、保存配置触发重启或正常退出时，当前和待发任务会取消；
+队列保存在内存中，不会在进程重启后重新发送。
+
+接口与状态：
+
+- `POST /api/send`：`{"text":"..."}`，返回已入队的 `message`（`id`、`text`、`source`）。
+- `POST /api/stop`：停止当前回复并暂停队列。
+- `POST /api/queue/resume`：继续队列；`DELETE /api/queue`：清空待发消息。
+- `/api/state` 和 `/api/events` 的 `status.conversation` 包含 `active`、`pending`、`paused`、
+  `stopping`、`error`；控制接口返回同样的 `conversation` 状态。
+
+离线回归（模拟 SDK 和音频设备）：
+
+```bash
+uv run python -m unittest -v tests.test_conversation
+```
+
 ## 聊天记录
 
 会话收到结束事件（道别或空闲超时）后，`llm.messages` 中非 `system` 的消息自动保存到
@@ -106,11 +133,17 @@ MiMo 需在 `.env` 配置 `MIMO_API_KEY`，可选 `MIMO_TTS_VOICE`（默认 `mim
 其他正文字符串原样保存，空值或缺省值存为 SQL NULL，结构化内容存为 JSON 文本；
 正文不包含外层 `role`、`time`、`tool_calls`、`audio_url` 等字段。
 token 用量保存在独立的 JSON 字段 `usage`，没有用量数据时为 SQL NULL。
+工具元数据直接保存在 `messages` 的四个可空字段中：助手消息的 JSON 字段 `tool_calls`
+保存完整调用列表（调用 ID、工具名、原始参数字符串）；工具结果消息的文本字段
+`tool_call_id`、`name`、`elapsed_time` 保存对应调用 ID、工具名和 SDK 返回的耗时（例如 `0.125s`）。
+正文、参数及结果均不做截断；没有元数据的字段为 SQL NULL，不创建额外的工具元数据表。
+这些字段与正文在同一事务中保存，不依赖 DEBUG。
 发送时间保存在独立的文本字段 `time`，优先使用消息顶层 `time`，缺失时提取
 `content` JSON 对象中的 `time`；保留原时间文本和时区偏移，没有时间时为 SQL NULL。
 说话人保存在独立的文本字段 `speaker`，优先使用消息顶层 `speaker`，缺失时提取
 `content` JSON 对象中的 `speaker`；没有说话人时为 SQL NULL。
-表结构由新数据库创建，不自动迁移旧数据库。
+新数据库按当前模型建表，现有数据库不自动迁移；使用现有数据库前需先确认 `messages` 已有上述四个字段。
+没有工具元数据的消息仍可查看正文，未保存过的调用参数和耗时无法补回。
 历史摘要和详情直接使用已入库的正文文本，不再解析正文中的 JSON。
 会话和消息在同一事务中写入，同一轮只保存一次。
 录音文件仍由 ASR 服务管理。
@@ -121,6 +154,7 @@ token 用量保存在独立的 JSON 字段 `usage`，没有用量数据时为 SQ
 ```bash
 sqlite3 data/db.sqlite3 'SELECT id, started_at, ended_at FROM sessions ORDER BY started_at DESC LIMIT 10;'
 sqlite3 data/db.sqlite3 "SELECT time, speaker, content, usage FROM messages WHERE session_id = '会话ID' ORDER BY position;"
+sqlite3 data/db.sqlite3 "SELECT position, tool_calls, tool_call_id, name, elapsed_time FROM messages WHERE session_id = '会话ID' ORDER BY position;"
 ```
 
 数据库和调试文件独立保存，写入失败会记录错误日志，不打断对话；
@@ -130,6 +164,11 @@ sqlite3 data/db.sqlite3 "SELECT time, speaker, content, usage FROM messages WHER
 配置台聊天区点击“历史会话”，进入独立页面 `/history`（[`history.html`](history.html)），
 可分页查看已保存的会话，按消息内容或会话 ID 搜索，
 并打开会话查看按顺序保存的消息、开始/结束时间和 token 用量。
+工具卡片集中显示工具名和耗时，并按 `tool_call_id` 匹配调用参数，
+可分别展开「参数」和「工具结果」；已有结果的调用不在助手消息中重复展示参数。
+尚无结果的调用仍在助手消息中保留；仅包含已配对调用、没有正文和用量的助手行不显示空白气泡。
+同一轮多个同名工具也按调用 ID 配对，不按名称或位置猜测。
+JSON 参数在页面格式化展示，非 JSON 参数原样显示，数据库保留原始字符串。
 搜索包含用户、助手和工具消息；留空并点击“搜索”即可刷新会话。
 日期筛选按配置台时区的会话开始日期计算，与日记归属日期一致，可与关键词一起使用；
 点击“全部日期”清除日期筛选。日期、关键词和页码保存在 URL 中，刷新后保留。
@@ -144,7 +183,8 @@ sqlite3 data/db.sqlite3 "SELECT time, speaker, content, usage FROM messages WHER
   `q` 同时匹配会话 ID 和任意消息内容，最长 200 字符；`limit` 为 1～100，`offset` 为非负整数。
   `date` 可选，按配置台时区筛选当天开始的会话，非法日期返回 400。
 - `GET /api/sessions/{session_id}`：返回 `session` 及按 `position` 排序的 `messages`，
-  每条消息包含 `position`、`role`、`speaker`、`time`、`content`、`usage`。会话不存在时返回 404。
+  每条消息包含 `position`、`role`、`speaker`、`time`、`content`、`usage`、`tool_calls`、
+  `tool_call_id`、`name`、`elapsed_time`；缺失的元数据返回 null。会话不存在时返回 404。
 
 数据库尚不存在时返回空列表，不创建文件；数据库不可读时返回 503，详细原因记录在服务日志。
 
@@ -302,11 +342,18 @@ uv run python -m unittest -v tests.test_volume_mcp
   时间按 `config.json` 的时区解释，弹窗在时间旁显示该时区。
 - 到点时，说明以一条 `【定时任务】` 开头的消息交给助手，需要时调用工具，然后用一两句话播报；
   同一时刻到点的任务合成一条消息。会话已结束时像唤醒词一样开一轮新会话，播报后可以直接接着说；
-  正在对话时最多等 60 秒让这一轮说完，再接在当前会话里执行。
+  正在对话时进入消息队列，等前面的回复和播放结束再执行，不打断当前回复。
 - harness 当时没在运行（关机、重启中）：15 分钟以内的照常补执行，更早的记为「已错过」，不再补。
   暂停后恢复或修改后，从改动的时刻往后找下一次，不补之前的时间点。
 - 列表里可以暂停 / 启用、编辑、删除和「立即运行」，立即运行不影响之后的排期。
-  执行失败（例如 TTS 未配置、ASR 未启动）时任务上显示原因，详细错误见服务日志。
+  同一任务已有排队或执行中的一轮时，不重复提交。修改、暂停和删除影响后续排期；
+  已入队的消息使用提交时的说明，可通过聊天区的「停止」和「清空」取消。
+- 状态按「排队中 → 执行中 → 已完成 / 执行失败 / 已取消」更新。
+  只有模型、工具调用链和音频播放正常结束后才标为完成；异步异常会保存失败原因。
+  完成表示本轮对话与播报正常结束，具体设备操作的结果以工具返回和实际状态为准。
+  执行结果落库失败时页面报错，后台重试保存结果，不重复执行任务。
+  正常退出会标记取消；断电或强杀留下的排队/执行中状态在下次启动时标为中断失败，
+  不自动重做可能已经产生副作用的操作，确认实际结果后可手动运行。
 - 历史会话里这条触发消息显示为用户消息；AI 日记把它记作「定时任务」，只有提醒、没人回话的会话不写日记。
 - 最多 50 个任务，说明最多 500 字。与配置台其他接口一样没有鉴权，同网段都能查看和修改。
 
@@ -325,7 +372,7 @@ MCP 配置里写了同名的「定时任务」时以配置为准，例如设 `"e
 - `GET /api/schedules`：返回 `tasks`、配置时区 `timezone`（如 `UTC+8`）和配置时区的今天 `today`。
   每个任务含 `id`、`title`、`prompt`、`repeat`（`once` / `hourly` / `daily` / `weekdays` / `weekly`）、
   `time`、`date`、`weekdays`、`enabled`，以及 `summary`、`next_run`、`status_text`、`last_run_text`、
-  `last_status`（`done` / `missed` / `error`）和 `last_error`。
+  `last_status`（`queued` / `running` / `done` / `missed` / `error` / `cancelled`）和 `last_error`。
 - `POST /api/schedules`：新建，例如 `{"prompt":"查询深圳今天的天气并播报","repeat":"weekdays","time":"08:00"}`；
   每周的任务加 `weekdays`（1=周一 … 7=周日），不重复的可加 `date`，或用 `in_minutes` 表示多少分钟后。
 - `PATCH /api/schedules/{id}`：只改提交的字段，例如 `{"enabled": false}` 暂停。

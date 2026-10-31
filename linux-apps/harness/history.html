@@ -123,6 +123,10 @@ details summary { cursor:pointer; color:var(--muted); font-size:12px; }
 #history-messages .msg.tool { padding:8px 12px; border-style:dashed; border-radius:8px; background:transparent; }
 #history-messages .msg.tool summary { font-size:11px; }
 #history-messages details pre { margin-top:8px; font-size:11px; }
+#history-messages .tool-call { margin-top:8px; padding:7px 9px; border:1px solid var(--line); border-radius:6px; }
+#history-messages .tool-arguments { margin:6px 0; }
+#history-messages .msg.tool .tool-name { color:var(--warn); font-weight:500; }
+#history-messages .tool-arguments pre, #history-messages .tool-call pre { max-height:240px; overflow:auto; }
 .history-placeholder { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; min-height:180px; height:100%; padding:28px 20px; text-align:center; color:var(--muted); }
 .history-placeholder > .history-icon { width:30px; height:30px; margin-bottom:4px; opacity:.45; stroke-width:1.2; }
 .history-placeholder strong { color:var(--fg); font-size:13px; font-weight:500; }
@@ -220,21 +224,43 @@ function formatUsage(usage) {
   return "↑" + prompt + hit + " ↓" + (usage.completion_tokens || 0) + ttft;
 }
 
-function renderMessage(message) {
+function formatArguments(argumentsValue) {
+  if (typeof argumentsValue !== "string") return JSON.stringify(argumentsValue, null, 2) ?? "";
+  try { return JSON.stringify(JSON.parse(argumentsValue), null, 2); }
+  catch { return argumentsValue; }
+}
+
+function toolArguments(call, className = "tool-arguments", label = "参数") {
+  const details = el("details", className);
+  details.append(el("summary", null, label), el("pre", null, formatArguments(call.function?.arguments)));
+  return details;
+}
+
+function renderMessage(message, call, unmatchedCalls) {
   const wrap = el("div", "msg " + (message.role || "unknown"));
   const head = el("div", "head");
-  head.append(el("span", "role", (message.role === "user" && message.speaker)
-    || ROLE_LABEL[message.role] || message.role || "未知"));
-  const meta = [(message.time || "").slice(11, 19), message.usage ? formatUsage(message.usage) : ""].filter(Boolean).join(" · ");
+  const toolName = message.role === "tool" ? message.name || call?.function?.name : "";
+  const role = el("span", "role" + (toolName ? " tool-name" : ""), toolName || (message.role === "user" && message.speaker)
+    || ROLE_LABEL[message.role] || message.role || "未知");
+  if (message.tool_call_id) role.title = "调用 ID：" + message.tool_call_id;
+  head.append(role);
+  const meta = [(message.time || "").slice(11, 19), message.elapsed_time != null ? "耗时 " + message.elapsed_time : "",
+    message.usage ? formatUsage(message.usage) : ""].filter(Boolean).join(" · ");
   if (meta) head.append(el("span", "meta", meta));
   wrap.append(head);
+  if (message.role === "tool" && call) wrap.append(toolArguments(call));
   const body = String(message.content ?? "");
   if (message.role === "tool" && body) {
-    const details = el("details");
+    const details = el("details", "tool-result");
     details.append(el("summary", null, "工具结果"), el("pre", null, body));
     wrap.append(details);
   } else if (body) {
     wrap.append(el("div", "body", body));
+  }
+  for (const toolCall of unmatchedCalls) {
+    const details = toolArguments(toolCall, "tool-call", "调用 " + (toolCall.function?.name || "未知工具"));
+    if (toolCall.id) details.title = "调用 ID：" + toolCall.id;
+    wrap.append(details);
   }
   return wrap;
 }
@@ -302,10 +328,11 @@ function historyDay(value) {
   });
 }
 
-function renderHistoryMessage(message) {
+function renderHistoryMessage(message, toolCalls, unmatchedCalls) {
   const role = message.role || "unknown";
+  if (role === "assistant" && !historyMessageText(message) && !message.usage && !unmatchedCalls.length) return null;
   const row = el("div", "history-entry " + role);
-  const node = renderMessage(message);
+  const node = renderMessage(message, toolCalls.get(message.tool_call_id), unmatchedCalls);
   if (role !== "tool") {
     const avatar = el("div", "history-avatar");
     avatar.setAttribute("aria-hidden", "true");
@@ -314,9 +341,8 @@ function renderHistoryMessage(message) {
   }
   if (role === "user" && node.querySelector(".role").textContent === ROLE_LABEL.user) node.querySelector(".role").textContent = "你";
   if (role === "tool") {
-    const summary = node.querySelector("summary");
+    const summary = node.querySelector(".tool-result summary");
     if (summary) {
-      node.querySelector(".head").remove();
       summary.textContent = "工具结果 · " + String(message.content).length + " 字";
     }
   }
@@ -373,7 +399,26 @@ async function loadHistoryDetail(sessionId, showDetail = true) {
     if (request !== historyDetailRequest) return;
     const session = data.session;
     renderHistoryMeta(session);
-    const nodes = session.messages.map(renderHistoryMessage);
+    const toolCalls = new Map();
+    const nodes = session.messages.map((message, index) => {
+      // 调用 ID 只在当前工具调用批次中配对，后续模型请求可能复用同一个 ID。
+      if (message.role === "assistant" || message.role === "user") toolCalls.clear();
+      let unmatchedCalls = [];
+      if (message.role === "assistant") {
+        for (const call of message.tool_calls || []) {
+          if (call.id) toolCalls.set(call.id, call);
+        }
+        // 已有结果的调用统一在工具卡片展示参数，助手里只留下尚无结果的调用。
+        const resultIds = new Set();
+        for (let next = index + 1; next < session.messages.length; next++) {
+          const result = session.messages[next];
+          if (result.role === "assistant" || result.role === "user") break;
+          if (result.role === "tool" && result.tool_call_id) resultIds.add(result.tool_call_id);
+        }
+        unmatchedCalls = (message.tool_calls || []).filter((call) => !call.id || !resultIds.has(call.id));
+      }
+      return renderHistoryMessage(message, toolCalls, unmatchedCalls);
+    }).filter(Boolean);
     $("#history-messages").replaceChildren(...(nodes.length ? nodes : [historyPlaceholder("暂无消息")]));
     $("#history-messages").scrollTop = 0;
   } catch (error) {

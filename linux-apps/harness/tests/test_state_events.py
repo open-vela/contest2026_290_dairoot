@@ -90,6 +90,22 @@ class StateEventsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((second["start"], second["messages"]), (0, self.client.msgs))
         self.assertEqual(second["status"]["round"], 1)
 
+    async def test_queue_changes_are_pushed_without_new_chat_messages(self):
+        conversation = {"active": None, "pending": [], "paused": False, "error": ""}
+        self.client.live_status = lambda: {"running": True, "conversation": {
+            **conversation, "pending": list(conversation["pending"]),
+        }}
+
+        def enqueue():
+            conversation["pending"] = [{"id": "message-1", "text": "等一会发", "source": "text"}]
+            conversation["paused"] = True
+
+        first, second = await self.frames(2, act=enqueue)
+        self.assertEqual(first["status"]["conversation"]["pending"], [])
+        self.assertEqual(second["messages"], [])
+        self.assertEqual(second["status"]["conversation"]["pending"][0]["id"], "message-1")
+        self.assertTrue(second["status"]["conversation"]["paused"])
+
 
 if __name__ == "__main__":
     unittest.main()
