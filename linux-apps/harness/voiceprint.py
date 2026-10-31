@@ -281,7 +281,7 @@ class VoiceprintChatBot(ChatBot):
 
     def __init__(self, *, voiceprints: VoiceprintClient, **kwargs):
         if "speaker" not in signature(ChatBot.send_text).parameters:
-            raise RuntimeError("当前 aichat-sdk 不支持 speaker 参数，请执行 uv sync 安装 aichat-sdk>=0.1.2")
+            raise RuntimeError("当前 aichat-sdk 不支持 speaker 参数，请执行 uv sync 安装 aichat-sdk>=0.1.4")
         super().__init__(**kwargs)
         self.voiceprints = voiceprints
         self.asr = PresetAsrClient(self.asr.url, voiceprints)

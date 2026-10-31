@@ -44,7 +44,7 @@ embedding 不发给浏览器或 LLM。
 页面显示并随聊天记录保存。harness 不进行二次声纹匹配，也不使用本地录入样本改写该字段。
 录入同步成功后，从后续语音开始由 ASR 匹配并返回姓名，既有消息保持原结果；打字消息不带 `speaker`。
 
-依赖已发布的 `aichat-sdk>=0.1.2`，执行 `uv sync` 即可安装，无需配置 `PYTHONPATH`。
+依赖已发布的 `aichat-sdk>=0.1.4`，执行 `uv sync` 即可安装，无需配置 `PYTHONPATH`。
 预设同步由 harness 的 `PresetAsrClient` 接入，沿用 SDK 的音频收发和 STT 调度。
 
 配置台内部接口（均由 harness 处理）：
@@ -64,7 +64,7 @@ uv run python -m unittest -v tests.test_voiceprint tests.test_asr_preset_sync te
 
 ## TTS 配置
 
-TTS 引擎选项从 SDK 的 `get_tts_engines()` 动态加载，项目使用 `aichat-sdk>=0.1.2`。
+TTS 引擎选项从 SDK 的 `get_tts_engines()` 动态加载，项目使用 `aichat-sdk>=0.1.4`。
 当前可选豆包 v1/v2、微软 Edge 和小米 MiMo；选择后保存配置即重启生效。
 MiMo 需在 `.env` 配置 `MIMO_API_KEY`，可选 `MIMO_TTS_VOICE`（默认 `mimo_default`）
 和 `MIMO_TTS_INSTRUCTIONS`。
