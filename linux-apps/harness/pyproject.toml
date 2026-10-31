@@ -5,7 +5,7 @@ description = "板上语音对话 demo：麦克风拾音 → ASR → LLM → TTS
 requires-python = ">=3.10"
 dependencies = [
     # 对话 SDK（LLM 流式、MCP 工具、TTS）。
-    "aichat-sdk>=0.1.2",
+    "aichat-sdk>=0.1.4",
     # web 配置台（改配置 / 看 llm.messages）。
     "starlette>=0.37",
     "uvicorn>=0.29",
